@@ -1,0 +1,128 @@
+# NIX+ Clock Package
+# Defines the nix_plus universal component linking UART communication with base clock CPU (PIC32),
+# tube display, RGB backlight cycling effects, hardware sensors, and auto brightness.
+
+nix_plus:
+  id: nix_clock
+  uart_id: uart_bus
+  time_id: sntp_time
+  ambient_mode_switch: ambient_brightness_mode
+  sntp_switch: sntp_switch
+  time_zone_text: time_zone_rule
+  detect_timezone_button: detect_timezone
+  num_digits: 0 # 0 = Auto-detect hardware & digit count via command 0x10 (NIX4, NIX6, NIX4F, FL4, VF4)
+  ambient_light:
+    name: "Ambient Light"
+    id: ambient_light_sensor
+    web_server:
+      sorting_group_id: sorting_sensors
+      sorting_weight: 1
+  temperature:
+    name: "Temperature"
+    id: temp_sensor
+    web_server:
+      sorting_group_id: sorting_sensors
+      sorting_weight: 2
+  night_mode:
+    name: "Night Mode"
+    id: night_mode_sensor
+    web_server:
+      sorting_group_id: sorting_clock
+      sorting_weight: 2
+  model_name:
+    name: "Clock Model"
+    id: clock_model_sensor
+    web_server:
+      sorting_group_id: sorting_clock
+      sorting_weight: 1
+  ip_address:
+    name: "IP Address"
+    id: clock_ip_sensor
+    web_server:
+      sorting_group_id: sorting_system
+      sorting_weight: 0
+  display:
+    name: "Display"
+    id: clock_display
+    default_transition_length: 0s
+    gamma_correct: 1.0
+    restore_mode: RESTORE_DEFAULT_ON
+    web_server:
+      sorting_group_id: sorting_clock
+      sorting_weight: 3
+    on_turn_off:
+      - light.turn_off: rgb_backlight
+  light:
+    name: "RGB Backlight"
+    id: rgb_backlight
+    default_transition_length: 0s
+    gamma_correct: 1.0
+    restore_mode: RESTORE_DEFAULT_ON
+    web_server:
+      sorting_group_id: sorting_backlight
+      sorting_weight: 1
+    effects:
+      - lambda:
+          name: "Colour Cycle - Extremely Slow"
+          update_interval: 24h
+          lambda: |-
+            // Handled autonomously by clock hardware (24hr/cycle)
+      - lambda:
+          name: "Colour Cycle - Extra Slow"
+          update_interval: 24h
+          lambda: |-
+            // Handled autonomously by clock hardware (1hr/cycle)
+      - lambda:
+          name: "Colour Cycle - Slow"
+          update_interval: 24h
+          lambda: |-
+            // Handled autonomously by clock hardware (30min/cycle)
+      - lambda:
+          name: "Colour Cycle - Medium"
+          update_interval: 24h
+          lambda: |-
+            // Handled autonomously by clock hardware (2min/cycle)
+      - lambda:
+          name: "Colour Cycle - Fast"
+          update_interval: 24h
+          lambda: |-
+            // Handled autonomously by clock hardware (1min/cycle)
+      - lambda:
+          name: "Colour Cycle - Extra Fast"
+          update_interval: 24h
+          lambda: |-
+            // Handled autonomously by clock hardware (10s/cycle)
+
+switch:
+  # Returns both tube display and RGB backlight to clock hardware auto-brightness
+  - platform: template
+    name: "Built-in Auto Brightness"
+    id: ambient_brightness_mode
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    web_server:
+      sorting_group_id: sorting_clock
+      sorting_weight: 4
+    on_turn_on:
+      then:
+        - lambda: |-
+            id(nix_clock).revert_lights();
+    on_turn_off:
+      then:
+        - lambda: |-
+            if (id(clock_display).remote_values.is_on()) {
+              float b = id(clock_display).remote_values.get_brightness();
+              uint8_t level = static_cast<uint8_t>(std::clamp(roundf(b * 7.0f), 0.0f, 7.0f));
+              id(nix_clock).set_display_brightness(level);
+            }
+
+button:
+  - platform: template
+    name: "Buzzer"
+    web_server:
+      sorting_group_id: sorting_system
+      sorting_weight: 1
+    on_press:
+      - lambda: |-
+          id(nix_clock).beep(2);
+

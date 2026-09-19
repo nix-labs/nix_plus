@@ -1,0 +1,167 @@
+name: Compile and Release Firmware
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      # Force runner to use Node 24 for all steps/actions
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install ESPHome and esptool
+        run: pip install esphome esptool
+
+      - name: Extract Version from YAML
+        id: get_version
+        run: |
+          # Use head -n 1 to grab the actual version substitution
+          RAW_VER=$(grep 'version:' nix_plus_factory.yaml | head -n 1 | awk '{print $2}' | tr -d '"')
+          echo "firmware_version=$RAW_VER" >> "$GITHUB_OUTPUT"
+
+      - name: Compile ESPHome Binary
+        run: |
+          esphome compile nix_plus_factory.yaml
+
+      - name: Prepare Assets and Manifest
+        id: prepare_assets
+        run: |
+          mkdir -p public/firmware
+          mkdir -p public/static
+          V_NUM="${{ steps.get_version.outputs.firmware_version }}"
+
+          # Locate build output directory
+          if [ -d ".esphome/build/nix-plus/.pioenvs/nix-plus" ]; then
+            BUILD_PATH=".esphome/build/nix-plus/.pioenvs/nix-plus"
+          elif [ -d ".esphome/build/nix-plus/build" ]; then
+            BUILD_PATH=".esphome/build/nix-plus/build"
+          elif [ -d ".esphome/build/nix_plus/.pioenvs/nix_plus" ]; then
+            BUILD_PATH=".esphome/build/nix_plus/.pioenvs/nix_plus"
+          elif [ -d ".esphome/build/nix_plus/build" ]; then
+            BUILD_PATH=".esphome/build/nix_plus/build"
+          else
+            BUILD_PATH=$(find .esphome/build -type d \( -name "build" -o -name ".pioenvs" \) | head -n 1)
+          fi
+
+          echo "Using build path: $BUILD_PATH"
+
+          # 1. Copy OTA binary
+          if [ -f "$BUILD_PATH/firmware.ota.bin" ]; then
+            cp "$BUILD_PATH/firmware.ota.bin" "public/firmware/nix_plus_${V_NUM}_ota.bin"
+          elif [ -f "$BUILD_PATH/firmware.bin" ]; then
+            cp "$BUILD_PATH/firmware.bin" "public/firmware/nix_plus_${V_NUM}_ota.bin"
+          elif [ -f "$BUILD_PATH/nix-plus.bin" ]; then
+            cp "$BUILD_PATH/nix-plus.bin" "public/firmware/nix_plus_${V_NUM}_ota.bin"
+          fi
+
+          # 2. Copy or create Merged Factory Binary
+          if [ -f "$BUILD_PATH/firmware.factory.bin" ]; then
+            cp "$BUILD_PATH/firmware.factory.bin" "public/firmware/nix_plus_${V_NUM}_factory.bin"
+          elif [ -f "$BUILD_PATH/bootloader.bin" ] && [ -f "$BUILD_PATH/partitions.bin" ]; then
+            cp "$BUILD_PATH/bootloader.bin" public/firmware/bootloader.bin
+            cp "$BUILD_PATH/partitions.bin" public/firmware/partitions.bin
+            if [ -f "$BUILD_PATH/ota_data_initial.bin" ]; then
+              cp "$BUILD_PATH/ota_data_initial.bin" public/firmware/ota_data_initial.bin
+              OTA_DATA="public/firmware/ota_data_initial.bin"
+            elif [ -f "$BUILD_PATH/boot_app0.bin" ]; then
+              cp "$BUILD_PATH/boot_app0.bin" public/firmware/boot_app0.bin
+              OTA_DATA="public/firmware/boot_app0.bin"
+            fi
+            esptool.py --chip esp32 merge_bin \
+              -o "public/firmware/nix_plus_${V_NUM}_factory.bin" \
+              --flash_mode dio \
+              --flash_size 4MB \
+              0x1000 public/firmware/bootloader.bin \
+              0x8000 public/firmware/partitions.bin \
+              0xe000 "$OTA_DATA" \
+              0x10000 "public/firmware/nix_plus_${V_NUM}_ota.bin"
+          fi
+
+          # 3. Bake the version into nix_plus.yaml for end-user import
+          cp nix_plus.yaml public/nix_plus.yaml
+          sed -i 's/v\${version}/v'"$V_NUM"'/g' public/nix_plus.yaml
+
+          # 4. Calculate MD5 for OTA binary
+          MD5_OTA=$(md5sum "public/firmware/nix_plus_${V_NUM}_ota.bin" | awk '{ print $1 }')
+
+          # 5. Create Manifest
+          cat <<EOF > public/firmware/manifest.json
+          {
+            "name": "NIX labs NIX+ Module",
+            "version": "$V_NUM",
+            "home_assistant_domain": "esphome",
+            "builds": [
+              {
+                "chipFamily": "ESP32",
+                "parts": [
+                  { "path": "nix_plus_${V_NUM}_factory.bin", "offset": 0 }
+                ],
+                "ota": {
+                  "path": "https://assets.nixlabs.com.au/nix_plus/firmware/nix_plus_${V_NUM}_ota.bin",
+                  "md5": "$MD5_OTA",
+                  "release_url": "https://github.com/nix-labs/nix_plus/releases/tag/v${V_NUM}",
+                  "summary": "Firmware update for NIX labs NIX+ Module v${V_NUM}"
+                }
+              }
+            ]
+          }
+          EOF
+
+          # 6. Copy static web assets
+          cp -r static/* public/static/
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          V_NUM="v${{ steps.get_version.outputs.firmware_version }}"
+          gh release create "$V_NUM" \
+            public/firmware/*.bin \
+            public/firmware/manifest.json \
+            --title "Release ${{ steps.get_version.outputs.firmware_version }}" \
+            --notes "Automated firmware build for $V_NUM" \
+            --generate-notes
+
+      - name: Upload Pages Artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: ./public
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: nix-plus-firmware-${{ steps.get_version.outputs.firmware_version }}
+          path: public/firmware/
+
+  deploy-pages:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5
+

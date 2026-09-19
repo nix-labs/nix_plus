@@ -1,0 +1,197 @@
+# NIX+ Inputs Package
+# Provides timer management and display override controls for the Nixie clock.
+
+text:
+  # Timer Duration input (HH:MM:SS)
+  - platform: template
+    name: "Timer Duration"
+    id: timer_duration
+    mode: text
+    optimistic: true
+    restore_value: true
+    initial_value: "00:00:10"
+    web_server:
+      sorting_group_id: sorting_timer
+      sorting_weight: 1
+    on_value:
+      then:
+        - lambda: |-
+            std::string s = x;
+            if (s.empty()) return;
+
+            // Clean input: remove everything except digits and colons
+            std::string clean;
+            for (char c : s) {
+              if (isdigit(c) || c == ':') clean += c;
+            }
+
+            std::vector<int> parts;
+            std::string current;
+            for (char c : clean) {
+              if (c == ':') {
+                if (!current.empty()) parts.push_back(std::stoi(current));
+                current = "";
+              } else {
+                current += c;
+              }
+            }
+            if (!current.empty()) parts.push_back(std::stoi(current));
+
+            int h = 0, m = 0, sec = 0;
+            if (parts.size() == 1) {
+              sec = parts[0];
+            } else if (parts.size() == 2) {
+              m = parts[0];
+              sec = parts[1];
+            } else if (parts.size() >= 3) {
+              h = parts[0];
+              m = parts[1];
+              sec = parts[2];
+            }
+
+            // Normalize (e.g. 90s -> 1m30s)
+            int total_seconds = h * 3600 + m * 60 + sec;
+            if (total_seconds < 0) total_seconds = 0;
+            if (total_seconds > 359999) total_seconds = 359999; // Cap at 99:59:59 (max for NIX firmware)
+
+            id(timer_h) = total_seconds / 3600;
+            id(timer_m) = (total_seconds % 3600) / 60;
+            id(timer_s) = total_seconds % 60;
+
+            char buf[12];
+            std::snprintf(buf, sizeof(buf), "%02d:%02d:%02d", id(timer_h), id(timer_m), id(timer_s));
+            std::string formatted = buf;
+
+            if (formatted != s) {
+              auto call = id(timer_duration)->make_call();
+              call.set_value(formatted);
+              call.perform();
+            }
+
+  # Numeric value to display on screen (digit count auto-detected from clock model)
+  - platform: template
+    name: "Display Number"
+    id: display_number_input
+    mode: text
+    pattern: "^[0-9.]*$"
+    optimistic: true
+    restore_value: true
+    initial_value: ""
+    web_server:
+      sorting_group_id: sorting_override
+      sorting_weight: 1
+
+number:
+  # Duration in seconds to display value (0 = indefinite)
+  - platform: template
+    name: "Display Duration"
+    id: display_duration
+    min_value: 0
+    max_value: 254
+    step: 1
+    initial_value: 5
+    optimistic: true
+    restore_value: true
+    unit_of_measurement: "s"
+    mode: box
+    web_server:
+      sorting_group_id: sorting_override
+      sorting_weight: 2
+
+button:
+  # Timer Controls
+  - platform: template
+    name: "Start Timer"
+    id: start_timer_button
+    web_server:
+      sorting_group_id: sorting_timer
+      sorting_weight: 2
+    on_press:
+      - lambda: |-
+          id(nix_clock).start_timer(id(timer_h), id(timer_m), id(timer_s));
+
+  - platform: template
+    name: "Pause Timer"
+    id: pause_timer_button
+    web_server:
+      sorting_group_id: sorting_timer
+      sorting_weight: 3
+    on_press:
+      - lambda: |-
+          id(nix_clock).pause_timer();
+
+  - platform: template
+    name: "Resume Timer"
+    id: resume_timer_button
+    web_server:
+      sorting_group_id: sorting_timer
+      sorting_weight: 4
+    on_press:
+      - lambda: |-
+          id(nix_clock).resume_timer();
+
+  - platform: template
+    name: "Stop Timer"
+    id: stop_timer_button
+    web_server:
+      sorting_group_id: sorting_timer
+      sorting_weight: 5
+    on_press:
+      - lambda: |-
+          id(nix_clock).stop_timer();
+
+  # Display Override & Screen Actions
+  - platform: template
+    name: "Display Number"
+    id: display_number_button
+    web_server:
+      sorting_group_id: sorting_override
+      sorting_weight: 3
+    on_press:
+      - lambda: |-
+          std::string val = id(display_number_input).state;
+          if (!val.empty()) {
+            uint8_t dur = 5;
+            if (!std::isnan(id(display_duration).state)) {
+              dur = static_cast<uint8_t>(id(display_duration).state);
+            }
+            id(nix_clock).display_value(val, dur);
+          } else {
+            ESP_LOGW("main", "Display Number input is empty; nothing to display.");
+          }
+
+  - platform: template
+    name: "Clear Display Override"
+    web_server:
+      sorting_group_id: sorting_override
+      sorting_weight: 4
+    on_press:
+      - lambda: |-
+          id(nix_clock).clear_display_override();
+
+  - platform: template
+    name: "Show Date Screen"
+    web_server:
+      sorting_group_id: sorting_override
+      sorting_weight: 5
+    on_press:
+      - lambda: |-
+          uint8_t dur = 5;
+          if (!std::isnan(id(display_duration).state)) {
+            dur = static_cast<uint8_t>(id(display_duration).state);
+          }
+          id(nix_clock).show_date_screen(dur);
+
+  - platform: template
+    name: "Show Temperature Screen"
+    web_server:
+      sorting_group_id: sorting_override
+      sorting_weight: 6
+    on_press:
+      - lambda: |-
+          uint8_t dur = 5;
+          if (!std::isnan(id(display_duration).state)) {
+            dur = static_cast<uint8_t>(id(display_duration).state);
+          }
+          id(nix_clock).show_temperature_screen(dur);
+

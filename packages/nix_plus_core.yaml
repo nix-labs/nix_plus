@@ -1,0 +1,129 @@
+# NIX+ Core Package
+# Defines system globals, ESPHome platform settings, Wi-Fi, Web UI, and base hardware UART.
+
+globals:
+  - id: timezone_configured
+    type: bool
+    restore_value: true
+    initial_value: "false"
+  - id: detected_iana
+    type: std::string
+  - id: detected_offset
+    type: std::string
+  - id: timer_h
+    type: int
+    initial_value: "0"
+  - id: timer_m
+    type: int
+    initial_value: "0"
+  - id: timer_s
+    type: int
+    initial_value: "10"
+
+esphome:
+  platformio_options:
+    board_build.flash_mode: dio
+
+# ESP32 platform configuration using esp-idf framework.
+# Note: Current modules use esp32dev (ESP32); production hardware revision will migrate to esp32-c3-devkitm-1 (ESP32-C3).
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+# Hardware UART0 for logging; leaves UART2 clean for base clock PIC32 and Improv Serial.
+logger:
+  level: INFO
+  hardware_uart: UART0
+  logs:
+    sensor: WARN
+    text_sensor: WARN
+    binary_sensor: WARN
+    switch: WARN
+    light: WARN
+    component: INFO
+    api: INFO
+    ota: INFO
+    wifi: INFO
+    web_server: INFO
+
+# Native API for Home Assistant
+api:
+  reboot_timeout: 0s
+
+# Over-The-Air Updates
+ota:
+  - platform: web_server # Allow uploading via web UI
+  - platform: esphome # Allow updating via ESPHome dashboard
+
+# Required for http_request and timezone discovery
+http_request:
+json:
+
+wifi:
+  # Disable WiFi power save to ensure responsive web interface and serial communications
+  power_save_mode: none
+
+  # Fallback Access Point
+  ap:
+    ssid: "${friendly_name}"
+    password: "12345678"
+
+# Captive Portal for fallback Wi-Fi configuration
+captive_portal:
+
+# Web Interface Configuration
+web_server:
+  id: web_ui
+  port: 80
+  version: 3
+
+  # Custom NIX labs branded JavaScript
+  js_url: https://assets.nixlabs.com.au/nix_plus/static/www.js
+
+  # Organize web entities into logical groups
+  sorting_groups:
+    - id: sorting_time
+      name: "Time Settings"
+      sorting_weight: 10
+    - id: sorting_clock
+      name: "Clock Settings"
+      sorting_weight: 20
+    - id: sorting_backlight
+      name: "Clock Backlight"
+      sorting_weight: 25
+    - id: sorting_sensors
+      name: "Sensors"
+      sorting_weight: 30
+    - id: sorting_timer
+      name: "Timer"
+      sorting_weight: 35
+    - id: sorting_override
+      name: "Display Override & Actions"
+      sorting_weight: 40
+    - id: sorting_system
+      name: "System"
+      sorting_weight: 60
+
+# Finalized hardware UART connection to base clock CPU (PIC32)
+uart:
+  - id: uart_bus
+    tx_pin: GPIO17
+    rx_pin: GPIO16
+    baud_rate: 115200
+
+button:
+  - platform: restart
+    name: "Restart"
+    id: restart_esp
+    web_server:
+      sorting_group_id: sorting_system
+      sorting_weight: 2
+
+  - platform: factory_reset
+    name: "Reset with Default Settings"
+    id: delete_all_config
+    disabled_by_default: true
+    web_server:
+      sorting_group_id: sorting_system
+      sorting_weight: 3

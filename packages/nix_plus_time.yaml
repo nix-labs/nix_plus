@@ -1,0 +1,217 @@
+# NIX+ Time Package
+# Manages network time synchronization (SNTP), hardware RTCC sync with base clock,
+# manual time setting, and automatic IP geolocation timezone detection.
+
+esphome:
+  on_boot:
+    # Priority -100: Initialise time zone from substitution default if not set
+    - priority: -100
+      then:
+        - lambda: |-
+            if (id(time_zone_rule).state.empty()) {
+              auto call = id(time_zone_rule).make_call();
+              call.set_value("${time_zone}");
+              call.perform();
+              ESP_LOGI("main", "Initialized Time Zone to default: %s", id(time_zone_rule).state.c_str());
+            }
+
+    # Priority 100: Network-dependent tasks (auto-detect TZ on first boot, trigger first SNTP sync)
+    - priority: 100
+      then:
+        - wait_until:
+            condition:
+              wifi.connected:
+        - if:
+            condition:
+              lambda: "return id(sntp_switch).state;"
+            then:
+              - lambda: "id(sntp_time)->update();"
+              - logger.log:
+                  level: INFO
+                  format: "Boot: WiFi connected — triggering SNTP sync."
+        - if:
+            condition:
+              lambda: "return !id(timezone_configured);"
+            then:
+              - button.press: detect_timezone
+              - globals.set:
+                  id: timezone_configured
+                  value: "true"
+
+time:
+  # Internet Time Sync (SNTP)
+  - platform: sntp
+    id: sntp_time
+    timezone: ${time_zone}
+    on_time_sync:
+      then:
+        - lambda: |-
+            id(nix_clock).sync_time_to_clock();
+            ESP_LOGW("main", "SNTP Synchronized — writing accurate time to clock RTCC.");
+
+interval:
+  # Periodic RTCC sync: keep base clock RTCC accurate during normal SNTP operation
+  - interval: 15min
+    then:
+      - if:
+          condition:
+            lambda: "return id(sntp_switch).state && id(sntp_time)->now().is_valid();"
+          then:
+            - lambda: "id(nix_clock).sync_time_to_clock();"
+            - logger.log:
+                level: INFO
+                format: "Periodic RTC sync: pushed internet time to base clock RTCC."
+
+switch:
+  # Master switch for internet time sync
+  - platform: template
+    name: "Enable SNTP Sync"
+    id: sntp_switch
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    web_server:
+      sorting_group_id: sorting_time
+      sorting_weight: 2
+    on_turn_on:
+      then:
+        - lambda: "id(sntp_time)->update();"
+
+text:
+  # POSIX Timezone String
+  - platform: template
+    name: "Time Zone"
+    id: time_zone_rule
+    mode: text
+    optimistic: true
+    restore_value: true
+    initial_value: ${time_zone}
+    web_server:
+      sorting_group_id: sorting_time
+      sorting_weight: 1
+    on_value:
+      then:
+        - lambda: |-
+            id(sntp_time)->set_timezone(x);
+            ESP_LOGI("main", "Timezone updated to: %s", x.c_str());
+        - lambda: |-
+            id(nix_clock).sync_time_to_clock();
+        - globals.set:
+            id: timezone_configured
+            value: "true"
+
+datetime:
+  # Manual time setting via Web UI
+  - platform: template
+    name: "Custom Time"
+    id: custom_time
+    type: datetime
+    initial_value: "2026-01-01 12:00:00"
+    optimistic: true
+    restore_value: false
+    web_server:
+      sorting_group_id: sorting_time
+      sorting_weight: 3
+    on_value:
+      then:
+        - lambda: |-
+            ESPTime t{};
+            t.year = x.year;
+            t.month = x.month;
+            t.day_of_month = x.day_of_month;
+            t.hour = x.hour;
+            t.minute = x.minute;
+            t.second = x.second;
+            id(nix_clock).sync_time_to_clock(t);
+        - switch.turn_off: sntp_switch
+        - logger.log:
+            level: WARN
+            format: "Manual time applied and sent to clock RTCC."
+
+button:
+  # Detect Timezone via IP Geolocation
+  - platform: template
+    name: "Auto-Detect Time Zone"
+    id: detect_timezone
+    web_server:
+      sorting_group_id: sorting_time
+      sorting_weight: 4
+    on_press:
+      then:
+        - logger.log: "Stage 1: Detecting IANA Timezone..."
+        - http_request.get:
+            url: "http://ipwho.is/"
+            request_headers:
+              User-Agent: "ESPHome/NIXPlus"
+            capture_response: true
+            on_response:
+              then:
+                - lambda: |-
+                    if (body.empty()) {
+                      ESP_LOGE("main", "Timezone Stage 1 failed. Check internet connection.");
+                      return;
+                    }
+                    json::parse_json(body, [](JsonObject root) -> bool {
+                      JsonObject tz = root["timezone"];
+                      if (tz["id"].is<const char*>() && tz["utc"].is<const char*>()) {
+                        id(detected_iana) = tz["id"].as<std::string>();
+                        id(detected_offset) = tz["utc"].as<std::string>();
+                        id(fetch_posix_rule).press();
+                        return true;
+                      }
+                      return false;
+                    });
+
+  # Stage 2: Lookup POSIX Rule from our static database
+  - platform: template
+    name: "Fetch POSIX Rule"
+    id: fetch_posix_rule
+    internal: true
+    on_press:
+      then:
+        - logger.log: "Stage 2: Looking up POSIX rule for city..."
+        - http_request.get:
+            url: !lambda |-
+              std::string iana = id(detected_iana);
+              size_t pos = iana.find('/');
+              std::string continent = (pos != std::string::npos) ? iana.substr(0, pos) : "Etc";
+              return "https://assets.nixlabs.com.au/nix_plus/static/" + continent + ".json";
+            request_headers:
+              User-Agent: "ESPHome/NIXPlus"
+            capture_response: true
+            on_response:
+              then:
+                - lambda: |-
+                    bool found = false;
+                    std::string iana = id(detected_iana);
+                    if (!body.empty()) {
+                      json::parse_json(body, [&found, iana](JsonObject root) -> bool {
+                        size_t pos = iana.find('/');
+                        std::string city = (pos != std::string::npos) ? iana.substr(pos + 1) : iana;
+                        if (root[city].is<const char*>()) {
+                          std::string posix = root[city].as<std::string>();
+                          auto call = id(time_zone_rule).make_call();
+                          call.set_value(posix);
+                          call.perform();
+                          ESP_LOGI("main", "Success! Applied POSIX rule for %s: %s", iana.c_str(), posix.c_str());
+                          found = true;
+                          return true;
+                        }
+                        return false;
+                      });
+                    }
+                    if (!found) {
+                      ESP_LOGW("main", "City '%s' not in DB. Fallback: ${time_zone}", iana.c_str());
+                      auto call = id(time_zone_rule).make_call();
+                      call.set_value("${time_zone}");
+                      call.perform();
+                    }
+
+  - platform: template
+    name: "Force RTC Sync Now"
+    web_server:
+      sorting_group_id: sorting_time
+      sorting_weight: 5
+    on_press:
+      - lambda: |-
+          id(nix_clock).sync_time_to_clock();
+
