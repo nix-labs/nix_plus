@@ -1420,10 +1420,10 @@ void NixPlus::process_binary_frame(const uint8_t *data, size_t len) {
 }
 
 std::string NixPlus::get_current_ip_str() {
-  if (wifi::global_wifi_component != nullptr && !wifi::global_wifi_component->is_connected()) {
+  if (wifi::global_wifi_component == nullptr || !wifi::global_wifi_component->is_connected()) {
     return "0.0.0.0";
   }
-  auto ips = network::get_ip_addresses();
+  auto ips = wifi::global_wifi_component->wifi_sta_ip_addresses();
   for (auto &ip : ips) {
     if (ip.is_set() && ip.is_ip4()) {
       char buf[network::IP_ADDRESS_BUFFER_SIZE];

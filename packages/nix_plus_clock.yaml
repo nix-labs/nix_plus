@@ -46,7 +46,7 @@ nix_plus:
     id: clock_display
     default_transition_length: 0s
     gamma_correct: 1.0
-    restore_mode: RESTORE_DEFAULT_ON
+    restore_mode: RESTORE_DEFAULT_OFF
     web_server:
       sorting_group_id: sorting_clock
       sorting_weight: 3
@@ -57,7 +57,7 @@ nix_plus:
     id: rgb_backlight
     default_transition_length: 0s
     gamma_correct: 1.0
-    restore_mode: RESTORE_DEFAULT_ON
+    restore_mode: RESTORE_DEFAULT_OFF
     web_server:
       sorting_group_id: sorting_backlight
       sorting_weight: 1

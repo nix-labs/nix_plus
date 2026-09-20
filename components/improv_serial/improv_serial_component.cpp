@@ -15,10 +15,13 @@ ImprovSerialComponent *global_improv_serial_component = nullptr;
 void ImprovSerialComponent::setup() {
   global_improv_serial_component = this;
 
-  if (wifi::global_wifi_component->has_sta()) {
+  if (wifi::global_wifi_component != nullptr && wifi::global_wifi_component->is_connected()) {
     this->state_ = improv::STATE_PROVISIONED;
-  } else if (!wifi::global_wifi_component->is_disabled()) {
-    wifi::global_wifi_component->start_scanning();
+  } else {
+    this->state_ = improv::STATE_AUTHORIZED;
+    if (wifi::global_wifi_component != nullptr && !wifi::global_wifi_component->is_disabled()) {
+      wifi::global_wifi_component->start_scanning();
+    }
   }
 }
 
@@ -50,6 +53,15 @@ void ImprovSerialComponent::loop() {
 
       std::vector<uint8_t> url = this->build_rpc_settings_response_(improv::WIFI_SETTINGS);
       this->send_response_(url);
+    }
+  } else if (wifi::global_wifi_component != nullptr) {
+    // Dynamically sync state if Wi-Fi connects externally (e.g. captive portal or BLE) or disconnects
+    if (wifi::global_wifi_component->is_connected()) {
+      if (this->state_ != improv::STATE_PROVISIONED) {
+        this->set_state_(improv::STATE_PROVISIONED);
+      }
+    } else if (!wifi::global_wifi_component->is_disabled() && this->state_ == improv::STATE_PROVISIONED) {
+      this->set_state_(improv::STATE_AUTHORIZED);
     }
   }
 }
@@ -171,11 +183,16 @@ bool ImprovSerialComponent::parse_improv_payload_(improv::ImprovCommand &command
       return true;
     }
     case improv::GET_CURRENT_STATE:
-      if (wifi::global_wifi_component->is_disabled()) {
+      if (wifi::global_wifi_component != nullptr && wifi::global_wifi_component->is_disabled()) {
         this->send_current_state_(improv::STATE_STOPPED);
         return true;
       }
-      this->set_state_(this->state_);
+      if (wifi::global_wifi_component != nullptr && wifi::global_wifi_component->is_connected()) {
+        this->state_ = improv::STATE_PROVISIONED;
+      } else if (this->state_ != improv::STATE_PROVISIONING) {
+        this->state_ = improv::STATE_AUTHORIZED;
+      }
+      this->send_current_state_(this->state_);
       if (this->state_ == improv::STATE_PROVISIONED) {
         std::vector<uint8_t> url = this->build_rpc_settings_response_(improv::GET_CURRENT_STATE);
         this->send_response_(url);
