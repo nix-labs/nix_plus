@@ -1,6 +1,6 @@
 substitutions:
   name: "nix-plus"
-  friendly_name: "NIX labs NIX+ Module"
+  friendly_name: "NIX labs NIX+"
   version: "0.9.0"
   time_zone: "AEST-10"
 

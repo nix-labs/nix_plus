@@ -104,7 +104,7 @@ jobs:
           # 5. Create Manifest
           cat <<EOF > public/firmware/manifest.json
           {
-            "name": "NIX labs NIX+ Module",
+            "name": "NIX labs NIX+",
             "version": "$V_NUM",
             "home_assistant_domain": "esphome",
             "builds": [

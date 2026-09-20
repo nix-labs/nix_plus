@@ -2,7 +2,7 @@ substitutions:
   # Unique name for the device in Home Assistant and network
   name: "nix-plus"
   # Friendly name displayed in UIs
-  friendly_name: "NIX labs NIX+ Module"
+  friendly_name: "NIX labs NIX+"
   # Fallback Time Zone in case auto-detection fails
   # Should be POSIX Timezone String
   # Find yours here: https://github.com/nayarsystems/posix_tz_db/blob/master/zones.csv

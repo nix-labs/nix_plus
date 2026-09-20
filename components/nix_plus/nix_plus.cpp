@@ -1420,6 +1420,9 @@ void NixPlus::process_binary_frame(const uint8_t *data, size_t len) {
 }
 
 std::string NixPlus::get_current_ip_str() {
+  if (wifi::global_wifi_component != nullptr && !wifi::global_wifi_component->is_connected()) {
+    return "0.0.0.0";
+  }
   auto ips = network::get_ip_addresses();
   for (auto &ip : ips) {
     if (ip.is_set() && ip.is_ip4()) {
@@ -1461,8 +1464,13 @@ void NixPlus::process_line(const std::string &line) {
     ESP_LOGI(TAG, "Replied OK to clock '%s'", line.c_str());
 
   } else if (line.find("_FWVERSION?") != std::string::npos || line.find("_APPVERSION?") != std::string::npos) {
-    this->write_str("1.00\r\n");
-    ESP_LOGI(TAG, "Replied to firmware version query '%s': 1.00", line.c_str());
+#ifdef ESPHOME_PROJECT_VERSION
+    this->write_str(ESPHOME_PROJECT_VERSION "\r\n");
+    ESP_LOGI(TAG, "Replied to firmware version query '%s': %s", line.c_str(), ESPHOME_PROJECT_VERSION);
+#else
+    this->write_str("0.9.0\r\n");
+    ESP_LOGI(TAG, "Replied to firmware version query '%s': 0.9.0", line.c_str());
+#endif
 
   } else if (line.find("TIME?") != std::string::npos) {
     ESPTime now{};
