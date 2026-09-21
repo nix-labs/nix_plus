@@ -43,6 +43,12 @@ time:
   - platform: sntp
     id: sntp_time
     timezone: ${time_zone}
+    # Use fast, reliable NTP servers for quick initial sync after WiFi connects
+    servers:
+      - 0.pool.ntp.org
+      - 1.pool.ntp.org
+      - time.cloudflare.com
+    update_interval: 15min
     on_time_sync:
       then:
         - lambda: |-
@@ -71,7 +77,7 @@ switch:
     restore_mode: RESTORE_DEFAULT_ON
     web_server:
       sorting_group_id: sorting_time
-      sorting_weight: 2
+      sorting_weight: 0
     on_turn_on:
       then:
         - lambda: "id(sntp_time)->update();"
@@ -94,38 +100,18 @@ text:
             id(sntp_time)->set_timezone(x);
             ESP_LOGI("main", "Timezone updated to: %s", x.c_str());
         - lambda: |-
-            id(nix_clock).sync_time_to_clock();
+            // Only sync time to the PIC32 if SNTP has a valid lock.
+            // restore_value fires on_value at boot before SNTP syncs — without
+            // this guard, the ESP32's default epoch time overwrites the PIC32 RTC.
+            auto now = id(sntp_time)->now();
+            if (now.is_valid() && now.year >= 2020) {
+              id(nix_clock).sync_time_to_clock();
+            } else {
+              ESP_LOGI("main", "Timezone restored at boot — skipping time sync (SNTP not yet valid)");
+            }
         - globals.set:
             id: timezone_configured
             value: "true"
-
-datetime:
-  # Manual time setting via Web UI
-  - platform: template
-    name: "Custom Time"
-    id: custom_time
-    type: datetime
-    initial_value: "2026-01-01 12:00:00"
-    optimistic: true
-    restore_value: false
-    web_server:
-      sorting_group_id: sorting_time
-      sorting_weight: 3
-    on_value:
-      then:
-        - lambda: |-
-            ESPTime t{};
-            t.year = x.year;
-            t.month = x.month;
-            t.day_of_month = x.day_of_month;
-            t.hour = x.hour;
-            t.minute = x.minute;
-            t.second = x.second;
-            id(nix_clock).sync_time_to_clock(t);
-        - switch.turn_off: sntp_switch
-        - logger.log:
-            level: WARN
-            format: "Manual time applied and sent to clock RTCC."
 
 button:
   # Detect Timezone via IP Geolocation
@@ -134,7 +120,7 @@ button:
     id: detect_timezone
     web_server:
       sorting_group_id: sorting_time
-      sorting_weight: 4
+      sorting_weight: 2
     on_press:
       then:
         - logger.log: "Stage 1: Detecting IANA Timezone..."
@@ -210,7 +196,7 @@ button:
     name: "Force RTC Sync Now"
     web_server:
       sorting_group_id: sorting_time
-      sorting_weight: 5
+      sorting_weight: 3
     on_press:
       - lambda: |-
           id(nix_clock).sync_time_to_clock();

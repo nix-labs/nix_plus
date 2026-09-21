@@ -21,7 +21,7 @@ update:
     source: https://assets.nixlabs.com.au/nix_plus/firmware/manifest.json
     web_server:
       sorting_group_id: sorting_system
-      sorting_weight: 1
+      sorting_weight: 2
 
 button:
   # Consolidated Update Management
@@ -30,7 +30,7 @@ button:
     id: update_firmware_button
     web_server:
       sorting_group_id: sorting_system
-      sorting_weight: 4
+      sorting_weight: 3
     on_press:
       then:
         - logger.log: "Initiating firmware update process..."

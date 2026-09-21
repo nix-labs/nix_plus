@@ -27,40 +27,39 @@ nix_plus:
     name: "Night Mode"
     id: night_mode_sensor
     web_server:
-      sorting_group_id: sorting_clock
-      sorting_weight: 2
+      sorting_group_id: sorting_sensors
+      sorting_weight: 3
   model_name:
     name: "Clock Model"
     id: clock_model_sensor
     web_server:
-      sorting_group_id: sorting_clock
-      sorting_weight: 1
+      sorting_group_id: sorting_system
+      sorting_weight: 0
   ip_address:
     name: "IP Address"
     id: clock_ip_sensor
+    disabled_by_default: true
     web_server:
       sorting_group_id: sorting_system
-      sorting_weight: 0
+      sorting_weight: 1
   display:
     name: "Display"
     id: clock_display
     default_transition_length: 0s
     gamma_correct: 1.0
-    restore_mode: RESTORE_DEFAULT_OFF
+    restore_mode: RESTORE_AND_OFF
     web_server:
       sorting_group_id: sorting_clock
       sorting_weight: 3
-    on_turn_off:
-      - light.turn_off: rgb_backlight
   light:
     name: "RGB Backlight"
     id: rgb_backlight
     default_transition_length: 0s
     gamma_correct: 1.0
-    restore_mode: RESTORE_DEFAULT_OFF
+    restore_mode: RESTORE_AND_OFF
     web_server:
-      sorting_group_id: sorting_backlight
-      sorting_weight: 1
+      sorting_group_id: sorting_clock
+      sorting_weight: 4
     effects:
       - lambda:
           name: "Colour Cycle - Extremely Slow"
@@ -94,34 +93,34 @@ nix_plus:
             // Handled autonomously by clock hardware (10s/cycle)
 
 switch:
-  # Returns both tube display and RGB backlight to clock hardware auto-brightness
+  # Toggles between clock automatic brightness control (ALS & presets) and manual ESP control
   - platform: template
-    name: "Built-in Auto Brightness"
+    name: "Auto Brightness"
     id: ambient_brightness_mode
     optimistic: true
-    restore_mode: RESTORE_DEFAULT_ON
+    restore_mode: ALWAYS_ON
     web_server:
       sorting_group_id: sorting_clock
-      sorting_weight: 4
+      sorting_weight: 5
     on_turn_on:
       then:
         - lambda: |-
-            id(nix_clock).revert_lights();
+            if (id(nix_clock).is_initial_sync_done()) {
+              id(nix_clock).revert_lights();
+            }
     on_turn_off:
       then:
         - lambda: |-
-            if (id(clock_display).remote_values.is_on()) {
-              float b = id(clock_display).remote_values.get_brightness();
-              uint8_t level = static_cast<uint8_t>(std::clamp(roundf(b * 7.0f), 0.0f, 7.0f));
-              id(nix_clock).set_display_brightness(level);
+            if (id(nix_clock).is_initial_sync_done()) {
+              id(nix_clock).apply_manual_lights();
             }
 
 button:
   - platform: template
     name: "Buzzer"
     web_server:
-      sorting_group_id: sorting_system
-      sorting_weight: 1
+      sorting_group_id: sorting_timer
+      sorting_weight: 0
     on_press:
       - lambda: |-
           id(nix_clock).beep(2);

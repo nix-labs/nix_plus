@@ -89,18 +89,15 @@ web_server:
     - id: sorting_clock
       name: "Clock Settings"
       sorting_weight: 20
-    - id: sorting_backlight
-      name: "Clock Backlight"
-      sorting_weight: 25
     - id: sorting_sensors
       name: "Sensors"
       sorting_weight: 30
     - id: sorting_timer
       name: "Timer"
-      sorting_weight: 35
+      sorting_weight: 40
     - id: sorting_override
       name: "Display Override & Actions"
-      sorting_weight: 40
+      sorting_weight: 50
     - id: sorting_system
       name: "System"
       sorting_weight: 60
@@ -118,7 +115,7 @@ button:
     id: restart_esp
     web_server:
       sorting_group_id: sorting_system
-      sorting_weight: 2
+      sorting_weight: 4
 
   - platform: factory_reset
     name: "Reset with Default Settings"
@@ -126,4 +123,4 @@ button:
     disabled_by_default: true
     web_server:
       sorting_group_id: sorting_system
-      sorting_weight: 3
+      sorting_weight: 5

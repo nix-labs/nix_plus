@@ -88,6 +88,9 @@ class NixPlus : public Component, public uart::UARTDevice {
   void set_time_zone_text(text::Text *t) { time_zone_text_ = t; }
   void set_detect_timezone_button(button::Button *b) { detect_timezone_button_ = b; }
   bool is_handshake_completed() const { return handshake_completed_; }
+  bool is_initial_sync_done() const { return initial_sync_done_; }
+  bool is_manual_backlight_active() const { return manual_backlight_active_; }
+  bool is_automated_mode() const { return ambient_mode_switch_ != nullptr && ambient_mode_switch_->state; }
 
   // Actions & Control (Existing clock commands)
   void display_number(float value, uint8_t duration_sec = 5);
@@ -103,6 +106,7 @@ class NixPlus : public Component, public uart::UARTDevice {
   void set_rgb_color(uint8_t r, uint8_t g, uint8_t b, uint8_t brightness = 255);
   void set_backlight_cycling(uint8_t mode);
   void revert_lights();
+  void apply_manual_lights();
   void schedule_state_confirmation();
   void play_tone(uint16_t frequency_hz, uint16_t duration_ms, uint8_t volume = 7);
   void beep(uint8_t count = 1);
@@ -120,6 +124,7 @@ class NixPlus : public Component, public uart::UARTDevice {
   // Periodic polling & handshakes
   void send_device_info_request(); // Opcode 0x10
   void read_clock_settings();      // Opcode 0x02
+  void read_backlight_settings();  // Opcode 0x09
   void request_sensors();          // Opcode 0x11
   void request_module_status();    // Opcode 0xE0
   void enable_clock_module();      // Opcode 0xE1
@@ -191,6 +196,16 @@ class NixPlus : public Component, public uart::UARTDevice {
   uint8_t clock_module_state_{0};
   uint8_t clock_module_mode_{0};
   bool initial_sync_done_{false};
+  int8_t initial_cycler_mode_{-1};
+  bool backlight_settings_valid_{false};
+  uint32_t last_backlight_settings_request_{0};
+  uint32_t last_backlight_settings_poll_{0};
+  bool manual_backlight_active_{false};
+  uint8_t cached_time_screen_colour_{0};
+  uint8_t cached_misc_opt2_{0};
+  uint8_t cached_custom_g_{0};
+  uint8_t cached_custom_r_{0};
+  uint8_t cached_custom_b_{0};
   switch_::Switch *ambient_mode_switch_{nullptr};
 
   std::deque<CommandTransaction> tx_queue_;
