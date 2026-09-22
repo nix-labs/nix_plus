@@ -1546,9 +1546,12 @@ void NixPlus::process_line(const std::string &line) {
     if (wifi::global_wifi_component != nullptr && wifi::global_wifi_component->is_connected()) {
       this->write_str("ACTIVE\r\n");
       ESP_LOGI(TAG, "Replied ACTIVE to base STATUS? probe");
+    } else if (wifi::global_wifi_component != nullptr && wifi::global_wifi_component->has_sta()) {
+      this->write_str("CONNECTING\r\n");
+      ESP_LOGI(TAG, "Replied CONNECTING to base STATUS? probe");
     } else {
-      this->write_str("STARTING\r\n");
-      ESP_LOGI(TAG, "Replied STARTING to base STATUS? probe");
+      this->write_str("UNPROVISIONED\r\n");
+      ESP_LOGI(TAG, "Replied UNPROVISIONED to base STATUS? probe");
     }
 
   } else if (line.find("WIFINETIP?") != std::string::npos ||
@@ -1663,6 +1666,12 @@ void NixPlus::process_line(const std::string &line) {
     } else {
       this->write_str("ERR\r\n");
     }
+
+  } else if (line.find("HASCREDS?") != std::string::npos || line.find("HASSTA?") != std::string::npos) {
+    bool has_creds = (wifi::global_wifi_component != nullptr && wifi::global_wifi_component->has_sta());
+    std::string resp = std::string("CREDS:") + (has_creds ? "1" : "0") + "\r\n";
+    this->write_str(resp.c_str());
+    ESP_LOGI(TAG, "Replied to HASCREDS?: %s", resp.c_str());
   }
 }
 
@@ -1784,7 +1793,9 @@ void NixPlus::loop() {
           line_buffer_ == "SETSNTP:1" ||
           line_buffer_ == "SETSNTP:0" ||
           line_buffer_ == "GETTZ?" ||
-          line_buffer_ == "AUTOTZ") {
+          line_buffer_ == "AUTOTZ" ||
+          line_buffer_ == "HASCREDS?" ||
+          line_buffer_ == "HASSTA?") {
         process_line(line_buffer_);
         line_buffer_.clear();
       } else if (line_buffer_.size() > 64) {
