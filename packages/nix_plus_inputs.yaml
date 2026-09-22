@@ -176,11 +176,7 @@ button:
       sorting_weight: 5
     on_press:
       - lambda: |-
-          uint8_t dur = 5;
-          if (!std::isnan(id(display_duration).state)) {
-            dur = static_cast<uint8_t>(id(display_duration).state);
-          }
-          id(nix_clock).show_date_screen(dur);
+          id(nix_clock).show_date_screen();
 
   - platform: template
     name: "Show Temperature Screen"
@@ -189,9 +185,5 @@ button:
       sorting_weight: 6
     on_press:
       - lambda: |-
-          uint8_t dur = 5;
-          if (!std::isnan(id(display_duration).state)) {
-            dur = static_cast<uint8_t>(id(display_duration).state);
-          }
-          id(nix_clock).show_temperature_screen(dur);
+          id(nix_clock).show_temperature_screen();
 

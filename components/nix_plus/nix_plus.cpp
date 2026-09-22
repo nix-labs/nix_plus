@@ -487,7 +487,6 @@ void NixPlus::set_display_light(bool is_on, float brightness) {
     ESP_LOGI(TAG, "Queued Display power OFF (0x20)");
 
     last_brightness_valid_ = false;
-    last_rgb_valid_ = false;
     return;
   }
 
@@ -501,7 +500,6 @@ void NixPlus::set_display_light(bool is_on, float brightness) {
     ESP_LOGI(TAG, "Queued Display power ON (0x20)");
 
     last_brightness_valid_ = false;
-    last_rgb_valid_ = false;
 
     // Wait for clock base soft starter to complete before sending brightness
     this->set_timeout("wake_finish", 150, [this, level]() {
@@ -511,7 +509,8 @@ void NixPlus::set_display_light(bool is_on, float brightness) {
       if (backlight_light_state_ != nullptr && backlight_light_state_->remote_values.is_on()) {
         if (active_backlight_effect_ >= 0) {
           set_backlight_cycling(active_backlight_effect_);
-        } else if (last_rgb_valid_) {
+        } else if (last_r_val_ > 0 || last_g_val_ > 0 || last_b_val_ > 0) {
+          last_rgb_valid_ = false; // ensure set_rgb_color actually transmits to clock
           set_rgb_color(last_r_val_, last_g_val_, last_b_val_, 255);
         }
       }
@@ -967,25 +966,47 @@ void NixPlus::clear_display_override() {
 }
 
 void NixPlus::show_temperature_screen(uint8_t duration_sec) {
-  uint8_t dur = (duration_sec == 0) ? 255 : (duration_sec == 1 ? 2 : std::min(static_cast<uint8_t>(254), duration_sec));
   uint8_t frame[64];
   std::memset(frame, 0, sizeof(frame));
   frame[0] = 0x20;
-  frame[0x11] = 1;
-  frame[0x27] = dur;
+  frame[0x11] = 1; // 1: Show temperature screen for default duration
+
+  // If display was off, wake it up so screen is immediately visible
+  if (!display_power_state_) {
+    frame[0x10] = 3; // display on / wake
+    display_power_state_ = true;
+    display_initialized_ = true;
+    if (display_light_state_ != nullptr) {
+      display_light_state_->current_values.set_state(true);
+      display_light_state_->remote_values.set_state(true);
+      display_light_state_->publish_state();
+    }
+  }
+
   queue_command(frame, 64, 0x20, 3);
-  ESP_LOGI(TAG, "Show Temperature Screen for %s", (dur == 255) ? "indefinite" : (std::to_string(dur) + " sec").c_str());
+  ESP_LOGI(TAG, "Show Temperature Screen (default duration)");
 }
 
 void NixPlus::show_date_screen(uint8_t duration_sec) {
-  uint8_t dur = (duration_sec == 0) ? 255 : (duration_sec == 1 ? 2 : std::min(static_cast<uint8_t>(254), duration_sec));
   uint8_t frame[64];
   std::memset(frame, 0, sizeof(frame));
   frame[0] = 0x20;
-  frame[0x11] = 2;
-  frame[0x27] = dur;
+  frame[0x11] = 2; // 2: Show date screen for default duration
+
+  // If display was off, wake it up so screen is immediately visible
+  if (!display_power_state_) {
+    frame[0x10] = 3; // display on / wake
+    display_power_state_ = true;
+    display_initialized_ = true;
+    if (display_light_state_ != nullptr) {
+      display_light_state_->current_values.set_state(true);
+      display_light_state_->remote_values.set_state(true);
+      display_light_state_->publish_state();
+    }
+  }
+
   queue_command(frame, 64, 0x20, 3);
-  ESP_LOGI(TAG, "Show Date Screen for %s", (dur == 255) ? "indefinite" : (std::to_string(dur) + " sec").c_str());
+  ESP_LOGI(TAG, "Show Date Screen (default duration)");
 }
 
 void NixPlus::show_demo_screen() {
