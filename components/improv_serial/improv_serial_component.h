@@ -43,6 +43,7 @@ class ImprovSerialComponent : public Component, public improv_base::ImprovBase, 
 
   // Method for external components (like NixPlus) to feed incoming Improv frames
   bool feed_byte(uint8_t byte);
+  bool is_active() const { return state_ != improv::STATE_PROVISIONED; }
 
  protected:
   bool parse_improv_serial_byte_(uint8_t byte);

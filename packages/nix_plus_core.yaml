@@ -8,8 +8,6 @@ globals:
     initial_value: "false"
   - id: detected_iana
     type: std::string
-  - id: detected_offset
-    type: std::string
   - id: timer_h
     type: int
     initial_value: "0"

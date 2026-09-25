@@ -16,6 +16,7 @@ namespace improv_serial {
 class ImprovSerialComponent {
  public:
   bool feed_byte(uint8_t byte);
+  bool is_active() const;
 };
 extern ImprovSerialComponent *global_improv_serial_component;
 }
@@ -223,6 +224,32 @@ void NixPlus::queue_command(const uint8_t *data, size_t len, uint8_t expected_re
   tx.attempts = 0;
   tx.last_send_ms = 0;
   tx.timeout_ms = 250;
+  // Coalesce / deduplicate rapid successive settings updates (opcode 0x08: brightness/color/cycle)
+  // If an unstarted transaction with the same sub-feature is already waiting in the queue,
+  // update its payload in-place instead of queueing backlogged commands.
+  if (tx.opcode == 0x08 && tx_queue_.size() > 1) {
+    for (size_t i = 1; i < tx_queue_.size(); i++) {
+      auto &pending = tx_queue_[i];
+      if (pending.attempts == 0 && pending.opcode == 0x08) {
+        // Match display brightness command: data[0x14] == 3 and data[2] == 0xFF
+        if (tx.data[0x14] == 3 && tx.data[2] == 0xFF && pending.data[0x14] == 3 && pending.data[2] == 0xFF) {
+          std::memcpy(pending.data, tx.data, sizeof(pending.data));
+          pending.expected_response = tx.expected_response;
+          pending.max_attempts = tx.max_attempts;
+          ESP_LOGD(TAG, "Coalesced pending display brightness update in TX queue");
+          return;
+        }
+        // Match RGB backlight command: data[5] == 1
+        if (tx.data[5] == 1 && pending.data[5] == 1) {
+          std::memcpy(pending.data, tx.data, sizeof(pending.data));
+          pending.expected_response = tx.expected_response;
+          pending.max_attempts = tx.max_attempts;
+          ESP_LOGD(TAG, "Coalesced pending RGB backlight update in TX queue");
+          return;
+        }
+      }
+    }
+  }
 
   if (tx_queue_.size() >= 10) {
     ESP_LOGW(TAG, "TX queue full (size %zu), dropping oldest command 0x%02X", tx_queue_.size(), tx_queue_.front().opcode);
@@ -249,11 +276,12 @@ void NixPlus::process_tx_queue() {
     send_packet(tx.data, 64);
   } else if (now - tx.last_send_ms > tx.timeout_ms) {
     if (tx.attempts < tx.max_attempts) {
+      uint32_t elapsed_ms = now - tx.last_send_ms;
       tx.attempts++;
       tx.last_send_ms = now;
       send_packet(tx.data, 64);
       ESP_LOGW(TAG, "Retry command 0x%02X (attempt %u/%u, %ums elapsed)",
-               tx.opcode, tx.attempts, tx.max_attempts, now - tx.last_send_ms);
+               tx.opcode, tx.attempts, tx.max_attempts, elapsed_ms);
     } else {
       ESP_LOGE(TAG, "Command 0x%02X failed: timed out after %u attempts with no clock response",
                tx.opcode, tx.max_attempts);
@@ -386,7 +414,6 @@ void NixPlus::sync_time_to_clock() {
       queue_command(frame, 64, 0x01, 3);
       ESP_LOGI(TAG, "Pushed internet time sync to clock (0x01): %04d-%02d-%02d %02d:%02d:%02d (wday %u)",
                now.year, now.month, now.day_of_month, now.hour, now.minute, now.second, wday);
-      trigger_time_sync();
       return;
     }
   }
@@ -423,7 +450,6 @@ void NixPlus::sync_time_to_clock(ESPTime now) {
   queue_command(frame, 64, 0x01, 3);
   ESP_LOGI(TAG, "Pushed manual time sync to clock (0x01): %04d-%02d-%02d %02d:%02d:%02d (wday %u)",
            now.year, now.month, now.day_of_month, now.hour, now.minute, now.second, wday);
-  trigger_time_sync();
 }
 
 void NixPlus::trigger_time_sync() {
@@ -778,14 +804,18 @@ void NixPlus::schedule_state_confirmation() {
 
 // Opcode 0x20: Value Override & Screen Trigger
 void NixPlus::display_number(float value, uint8_t duration_sec) {
+  if (value < 0.0f) {
+    ESP_LOGW(TAG, "display_number: negative value %.2f cannot be displayed (no minus symbol on tubes), clamping to 0", value);
+    value = 0.0f;
+  }
   uint8_t hr10 = 255, hr01 = 255, min10 = 255, min01 = 255, sec10 = 255, sec01 = 255;
   uint8_t col = 0;
 
-  uint32_t whole = static_cast<uint32_t>(fabsf(value));
-  uint32_t fract = static_cast<uint32_t>(roundf((fabsf(value) - whole) * 100));
+  uint32_t whole = static_cast<uint32_t>(value);
+  uint32_t fract = static_cast<uint32_t>(roundf((value - whole) * 100));
 
   if (num_digits_ == 4) {
-    if (fabsf(value) <= 99.99f) {
+    if (value <= 99.99f) {
       if (whole < 10) {
         hr10 = 255; // blanked
       } else {
@@ -802,7 +832,7 @@ void NixPlus::display_number(float value, uint8_t duration_sec) {
       min01 = whole % 10;
     }
   } else { // 6 digits
-    if (fabsf(value) <= 9999.99f) {
+    if (value <= 9999.99f) {
       hr10 = (whole / 1000) % 10;
       hr01 = (whole / 100) % 10;
       min10 = (whole / 10) % 10;
@@ -965,7 +995,7 @@ void NixPlus::clear_display_override() {
   ESP_LOGI(TAG, "Cleared display override");
 }
 
-void NixPlus::show_temperature_screen(uint8_t duration_sec) {
+void NixPlus::show_temperature_screen() {
   uint8_t frame[64];
   std::memset(frame, 0, sizeof(frame));
   frame[0] = 0x20;
@@ -987,7 +1017,7 @@ void NixPlus::show_temperature_screen(uint8_t duration_sec) {
   ESP_LOGI(TAG, "Show Temperature Screen (default duration)");
 }
 
-void NixPlus::show_date_screen(uint8_t duration_sec) {
+void NixPlus::show_date_screen() {
   uint8_t frame[64];
   std::memset(frame, 0, sizeof(frame));
   frame[0] = 0x20;
@@ -1721,8 +1751,11 @@ void NixPlus::loop() {
     }
 
     // 2. Improv header detection: "IMPROV" (0x49, 0x4D, 0x50, 0x52, 0x4F, 0x56)
+    // Only parse Improv frames if improv_serial is active (unprovisioned)
+    bool improv_active = (improv_serial::global_improv_serial_component != nullptr &&
+                          improv_serial::global_improv_serial_component->is_active());
     static const uint8_t IMPROV_MAGIC[6] = {'I', 'M', 'P', 'R', 'O', 'V'};
-    if (rx_buffer_.empty() && improv_rx_buffer_.size() < 6 && b == IMPROV_MAGIC[improv_rx_buffer_.size()]) {
+    if (improv_active && rx_buffer_.empty() && improv_rx_buffer_.size() < 6 && b == IMPROV_MAGIC[improv_rx_buffer_.size()]) {
       improv_rx_buffer_.push_back(b);
       last_improv_rx_ms_ = now;
       if (improv_rx_buffer_.size() == 6) {

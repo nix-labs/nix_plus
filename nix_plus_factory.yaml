@@ -1,7 +1,7 @@
 substitutions:
   name: "nix-plus"
   friendly_name: "NIX labs NIX+"
-  version: "0.9.3"
+  version: "0.9.4"
   time_zone: "AEST-10"
 
 esphome:

@@ -138,9 +138,8 @@ button:
                     }
                     json::parse_json(body, [](JsonObject root) -> bool {
                       JsonObject tz = root["timezone"];
-                      if (tz["id"].is<const char*>() && tz["utc"].is<const char*>()) {
+                      if (tz["id"].is<const char*>()) {
                         id(detected_iana) = tz["id"].as<std::string>();
-                        id(detected_offset) = tz["utc"].as<std::string>();
                         id(fetch_posix_rule).press();
                         return true;
                       }
@@ -172,8 +171,8 @@ button:
                     if (!body.empty()) {
                       json::parse_json(body, [&found, iana](JsonObject root) -> bool {
                         size_t pos = iana.find('/');
-                        std::string city = (pos != std::string::npos) ? iana.substr(pos + 1) : iana;
-                        if (root[city].is<const char*>()) {
+                        std::string city = (pos != std::string::npos && pos + 1 < iana.size()) ? iana.substr(pos + 1) : iana;
+                        if (!city.empty() && root[city].is<const char*>()) {
                           std::string posix = root[city].as<std::string>();
                           auto call = id(time_zone_rule).make_call();
                           call.set_value(posix);

@@ -29,13 +29,25 @@ text:
             std::string current;
             for (char c : clean) {
               if (c == ':') {
-                if (!current.empty()) parts.push_back(std::stoi(current));
+                if (!current.empty()) {
+                  char *endptr = nullptr;
+                  long val = strtol(current.c_str(), &endptr, 10);
+                  if (endptr != current.c_str() && val >= 0) {
+                    parts.push_back(static_cast<int>(std::min(val, 359999L)));
+                  }
+                }
                 current = "";
               } else {
                 current += c;
               }
             }
-            if (!current.empty()) parts.push_back(std::stoi(current));
+            if (!current.empty()) {
+              char *endptr = nullptr;
+              long val = strtol(current.c_str(), &endptr, 10);
+              if (endptr != current.c_str() && val >= 0) {
+                parts.push_back(static_cast<int>(std::min(val, 359999L)));
+              }
+            }
 
             int h = 0, m = 0, sec = 0;
             if (parts.size() == 1) {

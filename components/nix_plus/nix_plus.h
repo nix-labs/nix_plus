@@ -96,8 +96,8 @@ class NixPlus : public Component, public uart::UARTDevice {
   void display_number(float value, uint8_t duration_sec = 5);
   void display_value(const std::string &value_str, uint8_t duration_sec = 5);
   void clear_display_override();
-  void show_date_screen(uint8_t duration_sec = 5);
-  void show_temperature_screen(uint8_t duration_sec = 5);
+  void show_date_screen();
+  void show_temperature_screen();
   void show_demo_screen();
   void set_display_light(bool is_on, float brightness);
   void set_display_brightness(uint8_t level); // 0 (min) to 7 (100%)

@@ -35,14 +35,10 @@ void ImprovSerialComponent::loop() {
     ESP_LOGV(TAG, "Timeout");
   }
 
-  while (this->available()) {
-    uint8_t byte = this->read();
-    if (this->parse_improv_serial_byte_(byte)) {
-      this->last_read_byte_ = now;
-    } else {
-      this->last_read_byte_ = 0;
-      this->rx_buffer_.clear();
-    }
+  // Note: Direct UART reading is disabled here because NixPlus is the sole consumer
+  // of uart_bus, feeding valid Improv frames via feed_byte().
+  if (this->state_ == improv::STATE_PROVISIONED) {
+    return;
   }
 
   if (this->state_ == improv::STATE_PROVISIONING) {
