@@ -16,7 +16,6 @@ namespace improv_serial {
 class ImprovSerialComponent {
  public:
   bool feed_byte(uint8_t byte);
-  bool is_active() const;
 };
 extern ImprovSerialComponent *global_improv_serial_component;
 }
@@ -1751,9 +1750,8 @@ void NixPlus::loop() {
     }
 
     // 2. Improv header detection: "IMPROV" (0x49, 0x4D, 0x50, 0x52, 0x4F, 0x56)
-    // Only parse Improv frames if improv_serial is active (unprovisioned)
-    bool improv_active = (improv_serial::global_improv_serial_component != nullptr &&
-                          improv_serial::global_improv_serial_component->is_active());
+    // Only parse Improv frames if Wi-Fi credentials have not yet been provisioned
+    bool improv_active = (wifi::global_wifi_component != nullptr && !wifi::global_wifi_component->has_sta());
     static const uint8_t IMPROV_MAGIC[6] = {'I', 'M', 'P', 'R', 'O', 'V'};
     if (improv_active && rx_buffer_.empty() && improv_rx_buffer_.size() < 6 && b == IMPROV_MAGIC[improv_rx_buffer_.size()]) {
       improv_rx_buffer_.push_back(b);
