@@ -8,7 +8,12 @@
 #include <cstdio>
 #include <cstring>
 #include <cmath>
+#include <cctype>
 #include <algorithm>
+
+#ifdef USE_TIME_TIMEZONE
+#include "esphome/components/time/posix_tz.h"
+#endif
 
 namespace esphome {
 
@@ -115,19 +120,22 @@ void NixPlusLight::write_state(light::LightState *state) {
       return;
     }
 
+    float brightness = state->current_values.get_brightness();
+    uint8_t br_byte = static_cast<uint8_t>(std::clamp(roundf(brightness * 255.0f), 0.0f, 255.0f));
+
     std::string effect = state->get_effect_name().str();
     if (effect == "Colour Cycle - Extremely Slow") {
-      parent_->set_backlight_cycling(0);
+      parent_->set_backlight_cycling(0, br_byte);
     } else if (effect == "Colour Cycle - Extra Slow") {
-      parent_->set_backlight_cycling(1);
+      parent_->set_backlight_cycling(1, br_byte);
     } else if (effect == "Colour Cycle - Slow") {
-      parent_->set_backlight_cycling(2);
+      parent_->set_backlight_cycling(2, br_byte);
     } else if (effect == "Colour Cycle - Medium") {
-      parent_->set_backlight_cycling(3);
+      parent_->set_backlight_cycling(3, br_byte);
     } else if (effect == "Colour Cycle - Fast") {
-      parent_->set_backlight_cycling(4);
+      parent_->set_backlight_cycling(4, br_byte);
     } else if (effect == "Colour Cycle - Extra Fast") {
-      parent_->set_backlight_cycling(5);
+      parent_->set_backlight_cycling(5, br_byte);
     } else {
       float r_f, g_f, b_f;
       state->current_values_as_rgb(&r_f, &g_f, &b_f);
@@ -149,6 +157,13 @@ void NixPlusLight::write_state(light::LightState *state) {
 // NixPlus Component implementation
 void NixPlus::setup() {
   ESP_LOGCONFIG(TAG, "Setting up NIX+ Universal Network Component...");
+  if (wifi::global_wifi_component != nullptr && wifi::global_wifi_component->has_sta()) {
+    const auto &sta = wifi::global_wifi_component->get_sta();
+    if (sta.get_ssid().empty()) {
+      ESP_LOGW(TAG, "Detected corrupted STA entry with empty SSID; clearing credentials");
+      wifi::global_wifi_component->clear_sta();
+    }
+  }
   if (user_configured_digits_ > 0) {
     ESP_LOGCONFIG(TAG, "  User-configured digit count: %u", user_configured_digits_);
   } else {
@@ -246,6 +261,14 @@ void NixPlus::queue_command(const uint8_t *data, size_t len, uint8_t expected_re
           ESP_LOGD(TAG, "Coalesced pending RGB backlight update in TX queue");
           return;
         }
+        // Match RGB backlight cycling command: data[0x10] & 0x08
+        if ((tx.data[0x10] & 0x08) && (pending.data[0x10] & 0x08)) {
+          std::memcpy(pending.data, tx.data, sizeof(pending.data));
+          pending.expected_response = tx.expected_response;
+          pending.max_attempts = tx.max_attempts;
+          ESP_LOGD(TAG, "Coalesced pending RGB backlight cycling update in TX queue");
+          return;
+        }
       }
     }
   }
@@ -279,8 +302,8 @@ void NixPlus::process_tx_queue() {
       tx.attempts++;
       tx.last_send_ms = now;
       send_packet(tx.data, 64);
-      ESP_LOGW(TAG, "Retry command 0x%02X (attempt %u/%u, %ums elapsed)",
-               tx.opcode, tx.attempts, tx.max_attempts, elapsed_ms);
+      ESP_LOGW(TAG, "Retry command 0x%02X (attempt %u/%u, %lums elapsed)",
+               tx.opcode, tx.attempts, tx.max_attempts, static_cast<unsigned long>(elapsed_ms));
     } else {
       ESP_LOGE(TAG, "Command 0x%02X failed: timed out after %u attempts with no clock response",
                tx.opcode, tx.max_attempts);
@@ -460,6 +483,199 @@ void NixPlus::trigger_time_sync() {
   ESP_LOGI(TAG, "Triggered clock time sync probe (0xE1)");
 }
 
+#ifdef USE_TIME_TIMEZONE
+static bool parse_posix_offset(const char *&p, int32_t &seconds) {
+  int sign = 1;
+  if (*p == '-') {
+    sign = -1;
+    p++;
+  } else if (*p == '+') {
+    p++;
+  }
+  if (!isdigit(static_cast<unsigned char>(*p))) {
+    return false;
+  }
+  int h = 0;
+  while (isdigit(static_cast<unsigned char>(*p))) {
+    h = h * 10 + (*p - '0');
+    p++;
+  }
+  int m = 0;
+  if (*p == ':') {
+    p++;
+    while (isdigit(static_cast<unsigned char>(*p))) {
+      m = m * 10 + (*p - '0');
+      p++;
+    }
+  }
+  int s = 0;
+  if (*p == ':') {
+    p++;
+    while (isdigit(static_cast<unsigned char>(*p))) {
+      s = s * 10 + (*p - '0');
+      p++;
+    }
+  }
+  seconds = sign * (h * 3600 + m * 60 + s);
+  return true;
+}
+
+static void skip_posix_tz_name(const char *&p) {
+  if (*p == '<') {
+    p++;
+    while (*p && *p != '>') {
+      p++;
+    }
+    if (*p == '>') {
+      p++;
+    }
+  } else {
+    while (*p && isalpha(static_cast<unsigned char>(*p))) {
+      p++;
+    }
+  }
+}
+
+static bool parse_posix_dst_rule(const char *&p, time::DSTRule &rule) {
+  rule.time_seconds = 7200; // default 02:00:00
+  if (*p == 'M' || *p == 'm') {
+    p++;
+    int m = 0, w = 0, d = 0;
+    while (isdigit(static_cast<unsigned char>(*p))) {
+      m = m * 10 + (*p - '0');
+      p++;
+    }
+    if (*p != '.') return false;
+    p++;
+    while (isdigit(static_cast<unsigned char>(*p))) {
+      w = w * 10 + (*p - '0');
+      p++;
+    }
+    if (*p != '.') return false;
+    p++;
+    while (isdigit(static_cast<unsigned char>(*p))) {
+      d = d * 10 + (*p - '0');
+      p++;
+    }
+    rule.type = time::DSTRuleType::MONTH_WEEK_DAY;
+    rule.month = static_cast<uint8_t>(m);
+    rule.week = static_cast<uint8_t>(w);
+    rule.day_of_week = static_cast<uint8_t>(d);
+  } else if (*p == 'J' || *p == 'j') {
+    p++;
+    int day = 0;
+    while (isdigit(static_cast<unsigned char>(*p))) {
+      day = day * 10 + (*p - '0');
+      p++;
+    }
+    rule.type = time::DSTRuleType::JULIAN_NO_LEAP;
+    rule.day = static_cast<uint16_t>(day);
+  } else if (isdigit(static_cast<unsigned char>(*p))) {
+    int day = 0;
+    while (isdigit(static_cast<unsigned char>(*p))) {
+      day = day * 10 + (*p - '0');
+      p++;
+    }
+    rule.type = time::DSTRuleType::DAY_OF_YEAR;
+    rule.day = static_cast<uint16_t>(day);
+  } else {
+    return false;
+  }
+
+  if (*p == '/') {
+    p++;
+    int32_t t = 7200;
+    if (parse_posix_offset(p, t)) {
+      rule.time_seconds = t;
+    }
+  }
+  return true;
+}
+
+static bool parse_posix_tz_string(const std::string &tz_str, time::ParsedTimezone &tz) {
+  tz = {};
+  tz.dst_start.type = time::DSTRuleType::NONE;
+  tz.dst_end.type = time::DSTRuleType::NONE;
+  if (tz_str.empty()) {
+    return false;
+  }
+
+  const char *p = tz_str.c_str();
+  // 1. Standard name
+  skip_posix_tz_name(p);
+
+  // 2. Standard offset (positive = west, negative = east)
+  if (!parse_posix_offset(p, tz.std_offset_seconds)) {
+    return false;
+  }
+
+  if (*p == '\0') {
+    return true; // No DST
+  }
+
+  // 3. DST name
+  const char *dst_name_start = p;
+  skip_posix_tz_name(p);
+  if (p == dst_name_start) {
+    return true; // No DST name found
+  }
+
+  // 4. DST offset (optional, defaults to std - 1 hour)
+  if (*p != ',' && *p != '\0') {
+    if (!parse_posix_offset(p, tz.dst_offset_seconds)) {
+      tz.dst_offset_seconds = tz.std_offset_seconds - 3600;
+    }
+  } else {
+    tz.dst_offset_seconds = tz.std_offset_seconds - 3600;
+  }
+
+  if (*p != ',') {
+    return true;
+  }
+  p++; // skip ','
+
+  // 5. DST start rule
+  if (!parse_posix_dst_rule(p, tz.dst_start)) {
+    tz.dst_start.type = time::DSTRuleType::NONE;
+    return true;
+  }
+
+  if (*p != ',') {
+    return true;
+  }
+  p++; // skip ','
+
+  // 6. DST end rule
+  if (!parse_posix_dst_rule(p, tz.dst_end)) {
+    tz.dst_end.type = time::DSTRuleType::NONE;
+    return true;
+  }
+
+  return true;
+}
+#endif
+
+void NixPlus::set_timezone(const std::string &tz_str) {
+  if (tz_str.empty()) {
+    return;
+  }
+  setenv("TZ", tz_str.c_str(), 1);
+  tzset();
+
+#ifdef USE_TIME_TIMEZONE
+  time::ParsedTimezone tz{};
+  if (parse_posix_tz_string(tz_str, tz)) {
+    time::set_global_tz(tz);
+    ESP_LOGI(TAG, "Applied POSIX timezone to global RTC: %s (std_offset=%ld, dst_offset=%ld)",
+             tz_str.c_str(), static_cast<long>(tz.std_offset_seconds), static_cast<long>(tz.dst_offset_seconds));
+  } else {
+    ESP_LOGW(TAG, "Failed to parse POSIX timezone string: %s", tz_str.c_str());
+  }
+#else
+  ESP_LOGI(TAG, "Applied POSIX timezone to libc environment: %s", tz_str.c_str());
+#endif
+}
+
 // Opcode 0xE0: Read Module Status
 void NixPlus::request_module_status() {
   uint8_t frame[64];
@@ -533,7 +749,10 @@ void NixPlus::set_display_light(bool is_on, float brightness) {
       // Re-assert backlight settings if backlight is currently on
       if (backlight_light_state_ != nullptr && backlight_light_state_->remote_values.is_on()) {
         if (active_backlight_effect_ >= 0) {
-          set_backlight_cycling(active_backlight_effect_);
+          float br = backlight_light_state_->remote_values.get_brightness();
+          uint8_t br_byte = static_cast<uint8_t>(std::clamp(roundf(br * 255.0f), 0.0f, 255.0f));
+          last_cycling_brightness_valid_ = false;
+          set_backlight_cycling(active_backlight_effect_, br_byte);
         } else if (last_r_val_ > 0 || last_g_val_ > 0 || last_b_val_ > 0) {
           last_rgb_valid_ = false; // ensure set_rgb_color actually transmits to clock
           set_rgb_color(last_r_val_, last_g_val_, last_b_val_, 255);
@@ -636,6 +855,7 @@ void NixPlus::set_rgb_color(uint8_t r, uint8_t g, uint8_t b, uint8_t brightness)
     return;
   }
   active_backlight_effect_ = -1;
+  last_cycling_brightness_valid_ = false;
   last_g_val_ = g_val;
   last_r_val_ = r_val;
   last_b_val_ = b_val;
@@ -664,7 +884,7 @@ void NixPlus::set_rgb_color(uint8_t r, uint8_t g, uint8_t b, uint8_t brightness)
            r_val, g_val, b_val);
 }
 
-void NixPlus::set_backlight_cycling(uint8_t mode) {
+void NixPlus::set_backlight_cycling(uint8_t mode, uint8_t brightness) {
   manual_backlight_active_ = false;
   if (ambient_mode_switch_ != nullptr && ambient_mode_switch_->state) {
     ambient_mode_switch_->publish_state(false);
@@ -674,29 +894,55 @@ void NixPlus::set_backlight_cycling(uint8_t mode) {
   backlight_initialized_ = true;
 
   uint8_t safe_mode = std::min(static_cast<uint8_t>(5), mode);
-  if (active_backlight_effect_ == static_cast<int8_t>(safe_mode)) {
+  float b_scale = brightness / 255.0f;
+  uint8_t val = static_cast<uint8_t>(std::clamp(roundf(31.0f * b_scale), 1.0f, 31.0f));
+
+  if (active_backlight_effect_ == static_cast<int8_t>(safe_mode) &&
+      last_cycling_brightness_valid_ && last_cycling_brightness_val_ == val) {
     return;
   }
   active_backlight_effect_ = static_cast<int8_t>(safe_mode);
+  last_cycling_brightness_val_ = val;
+  last_cycling_brightness_valid_ = true;
   last_rgb_valid_ = false;
+
+  uint8_t col = (cached_time_screen_colour_ & 0x07);
+  if (col == 0) col = 4; // Default to preset 4 if unset
+  uint8_t screen_byte = (val << 3) | col;
+  uint8_t misc2 = 0x08 | (safe_mode & 0x07); // Bit 3=1 (cycler enable), Bits 0-2=mode (0-5)
+
+  // Update cached values so subsequent 0x09 poll won't treat this as an external change
+  cached_time_screen_colour_ = screen_byte;
+  cached_misc_opt2_ = misc2;
 
   uint8_t frame[64];
   std::memset(frame, 0, sizeof(frame));
   frame[0] = 0x08;
+  // Group A (bytes 2-5): Clear custom colour override so cycling effect takes over
   frame[2] = 0;
   frame[3] = 0;
   frame[4] = 0;
-  frame[5] = 0x00; // Clear custom colour so cycling effect takes over
-  frame[0x10] = 0x08 | (safe_mode & 0x07); // Enable LED cycle (bit 3 = 1) with mode (0-5)
+  frame[5] = 0x00; // Save 0: Clear custom colour from LEDs and unpause cycler
+  // Group B (bytes 6-10): Screen colours & brightness + miscOptions2
+  frame[6] = screen_byte; // Time screen colour & brightness (origBright = val)
+  frame[7] = screen_byte; // Date screen colour & brightness
+  frame[8] = screen_byte; // Temperature screen colour & brightness
+  frame[9] = 1;           // Save 1: Apply screen colours, brightness, and miscOptions2 to clock
+  frame[0x10] = misc2;    // Enable LED cycle (bit 3 = 1) with mode (0-5)
+
   // Apply firmware's configured colour offset / shift from cached miscOptions4 (bits 7-6)
-  uint8_t fw_shift = (clock_settings_[6] >> 6) & 0x03;
-  frame[0x11] = 0x80 | fw_shift;
+  if (clock_settings_valid_) {
+    uint8_t fw_shift = (clock_settings_[6] >> 6) & 0x03;
+    frame[0x11] = 0x80 | fw_shift;
+  } else {
+    frame[0x11] = 0x00;
+  }
   frame[0x13] = 0xFF; // Out of range tube brightness to skip Group E
   frame[0x14] = 0;
 
   queue_command(frame, 64, 0x08, 3);
-  ESP_LOGI(TAG, "Queued RGB Backlight cycling effect: mode %u (LEDopt=0x%02X, Shift=0x%02X)",
-           safe_mode, frame[0x10], frame[0x11]);
+  ESP_LOGI(TAG, "Queued RGB Backlight cycling effect: mode %u, brightness %u (val=%u, screenByte=0x%02X, misc2=0x%02X, Shift=0x%02X)",
+           safe_mode, brightness, val, screen_byte, misc2, frame[0x11]);
 }
 
 void NixPlus::revert_lights() {
@@ -721,6 +967,7 @@ void NixPlus::revert_lights() {
   last_brightness_valid_ = false;
   last_rgb_valid_ = false;
   active_backlight_effect_ = -1;
+  last_cycling_brightness_valid_ = false;
   ESP_LOGI(TAG, "Queued revert lights to hardware defaults (Save=5, Save=0, Shift=0x%02X)", frame[0x11]);
 
   // Turn off the two light components in ESPHome UI to reflect hardware auto control
@@ -766,19 +1013,21 @@ void NixPlus::apply_manual_lights() {
     backlight_light_state_->current_values.set_state(true);
     backlight_light_state_->remote_values = backlight_light_state_->current_values;
     backlight_light_state_->publish_state();
+    float br = backlight_light_state_->remote_values.get_brightness();
+    uint8_t br_byte = static_cast<uint8_t>(std::clamp(roundf(br * 255.0f), 0.0f, 255.0f));
     std::string effect = backlight_light_state_->get_effect_name().str();
     if (effect == "Colour Cycle - Extremely Slow") {
-      set_backlight_cycling(0);
+      set_backlight_cycling(0, br_byte);
     } else if (effect == "Colour Cycle - Extra Slow") {
-      set_backlight_cycling(1);
+      set_backlight_cycling(1, br_byte);
     } else if (effect == "Colour Cycle - Slow") {
-      set_backlight_cycling(2);
+      set_backlight_cycling(2, br_byte);
     } else if (effect == "Colour Cycle - Medium") {
-      set_backlight_cycling(3);
+      set_backlight_cycling(3, br_byte);
     } else if (effect == "Colour Cycle - Fast") {
-      set_backlight_cycling(4);
+      set_backlight_cycling(4, br_byte);
     } else if (effect == "Colour Cycle - Extra Fast") {
-      set_backlight_cycling(5);
+      set_backlight_cycling(5, br_byte);
     } else {
       float r_f, g_f, b_f;
       backlight_light_state_->current_values_as_rgb(&r_f, &g_f, &b_f);
@@ -1053,7 +1302,7 @@ void NixPlus::start_timer(uint32_t seconds) {
     return;
   }
   if (seconds > 359999) {
-    ESP_LOGW(TAG, "Timer duration %u exceeds maximum (359999s = 99h 59m 59s)", seconds);
+    ESP_LOGW(TAG, "Timer duration %lu exceeds maximum (359999s = 99h 59m 59s)", static_cast<unsigned long>(seconds));
     seconds = 359999;
   }
 
@@ -1080,8 +1329,11 @@ void NixPlus::start_timer(uint32_t seconds) {
   }
 
   queue_command(frame, 64, 0x20, 3);
-  ESP_LOGI(TAG, "Started timer for %u sec (%02u:%02u:%02u)",
-           seconds, seconds / 3600, (seconds % 3600) / 60, seconds % 60);
+  ESP_LOGI(TAG, "Started timer for %lu sec (%02lu:%02lu:%02lu)",
+           static_cast<unsigned long>(seconds),
+           static_cast<unsigned long>(seconds / 3600),
+           static_cast<unsigned long>((seconds % 3600) / 60),
+           static_cast<unsigned long>(seconds % 60));
 }
 
 void NixPlus::start_timer(uint8_t hours, uint8_t minutes, uint8_t seconds) {
@@ -1297,8 +1549,10 @@ void NixPlus::process_binary_frame(const uint8_t *data, size_t len) {
       cached_custom_r_ = custom_r;
       cached_custom_b_ = custom_b;
       backlight_settings_valid_ = true;
-      ESP_LOGI(TAG, "Clock backlight settings cached (0x09): time_colour=0x%02X, cycler=%s, mode=%u",
-               time_screen_colour, cycler_enabled ? "ON" : "OFF", cycler_mode);
+      clock_settings_[6] = data[0x0D];
+      clock_settings_valid_ = true;
+      ESP_LOGI(TAG, "Clock backlight settings cached (0x09): time_colour=0x%02X, cycler=%s, mode=%u, misc4=0x%02X",
+               time_screen_colour, cycler_enabled ? "ON" : "OFF", cycler_mode, data[0x0D]);
     } else {
       bool settings_changed_externally = (time_screen_colour != cached_time_screen_colour_ ||
                                           misc_opt2 != cached_misc_opt2_ ||
@@ -1327,6 +1581,7 @@ void NixPlus::process_binary_frame(const uint8_t *data, size_t len) {
 
         if (new_cycler_mode != active_backlight_effect_) {
           active_backlight_effect_ = new_cycler_mode;
+          last_cycling_brightness_valid_ = false;
           bool is_auto = (ambient_mode_switch_ != nullptr && ambient_mode_switch_->state);
           if (backlight_light_state_ != nullptr && !is_auto) {
             if (new_cycler_mode >= 0 && new_cycler_mode <= 5) {
@@ -1450,6 +1705,7 @@ void NixPlus::process_binary_frame(const uint8_t *data, size_t len) {
           last_b_val_ = 0;
           last_rgb_valid_ = true;
           active_backlight_effect_ = -1;
+          last_cycling_brightness_valid_ = false;
 
           backlight_light_state_->current_values.set_state(false);
           backlight_light_state_->remote_values = backlight_light_state_->current_values;
@@ -1483,6 +1739,7 @@ void NixPlus::process_binary_frame(const uint8_t *data, size_t len) {
 
           if (initial_cycler_mode_ >= 0 && initial_cycler_mode_ <= 5) {
             active_backlight_effect_ = initial_cycler_mode_;
+            last_cycling_brightness_valid_ = false;
             if (!is_automated_mode) {
               static const char *const CYCLER_EFFECTS[6] = {
                 "Colour Cycle - Extremely Slow",
@@ -1499,6 +1756,7 @@ void NixPlus::process_binary_frame(const uint8_t *data, size_t len) {
             }
           } else {
             active_backlight_effect_ = -1;
+            last_cycling_brightness_valid_ = false;
           }
         }
       }
@@ -1575,12 +1833,9 @@ void NixPlus::process_line(const std::string &line) {
     if (wifi::global_wifi_component != nullptr && wifi::global_wifi_component->is_connected()) {
       this->write_str("ACTIVE\r\n");
       ESP_LOGI(TAG, "Replied ACTIVE to base STATUS? probe");
-    } else if (wifi::global_wifi_component != nullptr && wifi::global_wifi_component->has_sta()) {
-      this->write_str("CONNECTING\r\n");
-      ESP_LOGI(TAG, "Replied CONNECTING to base STATUS? probe");
     } else {
-      this->write_str("UNPROVISIONED\r\n");
-      ESP_LOGI(TAG, "Replied UNPROVISIONED to base STATUS? probe");
+      this->write_str("STARTING\r\n");
+      ESP_LOGI(TAG, "Replied STARTING to base STATUS? probe");
     }
 
   } else if (line.find("WIFINETIP?") != std::string::npos ||
@@ -1698,6 +1953,9 @@ void NixPlus::process_line(const std::string &line) {
 
   } else if (line.find("HASCREDS?") != std::string::npos || line.find("HASSTA?") != std::string::npos) {
     bool has_creds = (wifi::global_wifi_component != nullptr && wifi::global_wifi_component->has_sta());
+    if (has_creds && wifi::global_wifi_component->get_sta().get_ssid().empty()) {
+      has_creds = false;
+    }
     std::string resp = std::string("CREDS:") + (has_creds ? "1" : "0") + "\r\n";
     this->write_str(resp.c_str());
     ESP_LOGI(TAG, "Replied to HASCREDS?: %s", resp.c_str());
@@ -1750,10 +2008,8 @@ void NixPlus::loop() {
     }
 
     // 2. Improv header detection: "IMPROV" (0x49, 0x4D, 0x50, 0x52, 0x4F, 0x56)
-    // Only parse Improv frames if Wi-Fi credentials have not yet been provisioned
-    bool improv_active = (wifi::global_wifi_component != nullptr && !wifi::global_wifi_component->has_sta());
     static const uint8_t IMPROV_MAGIC[6] = {'I', 'M', 'P', 'R', 'O', 'V'};
-    if (improv_active && rx_buffer_.empty() && improv_rx_buffer_.size() < 6 && b == IMPROV_MAGIC[improv_rx_buffer_.size()]) {
+    if (rx_buffer_.empty() && improv_rx_buffer_.size() < 6 && b == IMPROV_MAGIC[improv_rx_buffer_.size()]) {
       improv_rx_buffer_.push_back(b);
       last_improv_rx_ms_ = now;
       if (improv_rx_buffer_.size() == 6) {

@@ -17,8 +17,6 @@ void ImprovSerialComponent::setup() {
 
   if (wifi::global_wifi_component != nullptr && wifi::global_wifi_component->is_connected()) {
     this->state_ = improv::STATE_PROVISIONED;
-  } else if (wifi::global_wifi_component != nullptr && wifi::global_wifi_component->has_sta()) {
-    this->state_ = improv::STATE_PROVISIONING;
   } else {
     this->state_ = improv::STATE_AUTHORIZED;
     if (wifi::global_wifi_component != nullptr && !wifi::global_wifi_component->is_disabled()) {
@@ -37,14 +35,9 @@ void ImprovSerialComponent::loop() {
 
   // Note: Direct UART reading is disabled here because NixPlus is the sole consumer
   // of uart_bus, feeding valid Improv frames via feed_byte().
-  if (this->state_ == improv::STATE_PROVISIONED) {
-    return;
-  }
 
   if (this->state_ == improv::STATE_PROVISIONING) {
-    if (wifi::global_wifi_component->is_connected()) {
-      wifi::global_wifi_component->save_wifi_sta(this->connecting_sta_.get_ssid(),
-                                                 this->connecting_sta_.get_password());
+    if (wifi::global_wifi_component != nullptr && wifi::global_wifi_component->is_connected()) {
       this->connecting_sta_ = {};
       this->cancel_timeout("wifi-connect-timeout");
       this->set_state_(improv::STATE_PROVISIONED);
@@ -59,11 +52,7 @@ void ImprovSerialComponent::loop() {
         this->set_state_(improv::STATE_PROVISIONED);
       }
     } else if (!wifi::global_wifi_component->is_disabled() && this->state_ == improv::STATE_PROVISIONED) {
-      if (wifi::global_wifi_component->has_sta()) {
-        this->set_state_(improv::STATE_PROVISIONING);
-      } else {
-        this->set_state_(improv::STATE_AUTHORIZED);
-      }
+      this->set_state_(improv::STATE_AUTHORIZED);
     }
   }
 }
@@ -155,10 +144,16 @@ bool ImprovSerialComponent::parse_improv_serial_byte_(uint8_t byte) {
   const uint8_t *raw = &this->rx_buffer_[0];
 
   return improv::parse_improv_serial_byte(
-      at, byte, raw, [this](improv::ImprovCommand command) -> bool { return this->parse_improv_payload_(command); },
+      at, byte, raw,
+      [this](improv::ImprovCommand command) -> bool {
+        bool ok = this->parse_improv_payload_(command);
+        this->rx_buffer_.clear();
+        return ok;
+      },
       [this](improv::Error error) -> void {
         ESP_LOGW(TAG, "Error decoding payload");
         this->set_error_(error);
+        this->rx_buffer_.clear();
       });
 }
 
@@ -170,18 +165,34 @@ bool ImprovSerialComponent::parse_improv_payload_(improv::ImprovCommand &command
         this->set_error_(improv::ERROR_UNABLE_TO_CONNECT);
         return true;
       }
-      wifi::WiFiAP sta{};
-      sta.set_ssid(command.ssid.c_str());
-      sta.set_password(command.password.c_str());
-      this->connecting_sta_ = sta;
+      this->connecting_sta_ = {};
+      this->connecting_sta_.set_ssid(command.ssid);
+      this->connecting_sta_.set_password(command.password);
 
-      wifi::global_wifi_component->set_sta(sta);
-      wifi::global_wifi_component->start_connecting(sta);
+      // Match known AP from previous scan to supply BSSID and Channel for instant FAST_SCAN
+      if (wifi::global_wifi_component != nullptr) {
+        wifi::ScanResultsLock lock(wifi::global_wifi_component);
+        for (const auto &res : wifi::global_wifi_component->get_scan_result()) {
+          if (res.get_ssid() == command.ssid) {
+            this->connecting_sta_.set_bssid(res.get_bssid());
+            this->connecting_sta_.set_channel(res.get_channel());
+            ESP_LOGI(TAG, "Matched scanned AP for '%s': Channel %u", command.ssid.c_str(), res.get_channel());
+            break;
+          }
+        }
+      }
+
+      // Save credentials immediately to flash so they persist across reboots
+      wifi::global_wifi_component->save_wifi_sta(command.ssid.c_str(), command.password.c_str());
+
+      wifi::global_wifi_component->set_sta(this->connecting_sta_);
+      wifi::global_wifi_component->start_connecting(this->connecting_sta_);
+
       this->set_state_(improv::STATE_PROVISIONING);
       ESP_LOGD(TAG, "Received settings: SSID=%s, password=" LOG_SECRET("%s"), command.ssid.c_str(),
                command.password.c_str());
 
-      this->set_timeout("wifi-connect-timeout", 35000, [this]() { this->on_wifi_connect_timeout_(); });
+      this->set_timeout("wifi-connect-timeout", 45000, [this]() { this->on_wifi_connect_timeout_(); });
       return true;
     }
     case improv::GET_CURRENT_STATE:
@@ -191,11 +202,7 @@ bool ImprovSerialComponent::parse_improv_payload_(improv::ImprovCommand &command
       }
       if (wifi::global_wifi_component != nullptr && wifi::global_wifi_component->is_connected()) {
         this->state_ = improv::STATE_PROVISIONED;
-      } else if (this->state_ == improv::STATE_PROVISIONING) {
-        // Keep in provisioning state
-      } else if (wifi::global_wifi_component != nullptr && wifi::global_wifi_component->has_sta()) {
-        this->state_ = improv::STATE_PROVISIONING;
-      } else {
+      } else if (this->state_ != improv::STATE_PROVISIONING) {
         this->state_ = improv::STATE_AUTHORIZED;
       }
       this->send_current_state_(this->state_);
@@ -272,7 +279,7 @@ void ImprovSerialComponent::on_wifi_connect_timeout_() {
   this->set_error_(improv::ERROR_UNABLE_TO_CONNECT);
   this->set_state_(improv::STATE_AUTHORIZED);
   ESP_LOGW(TAG, "Timed out while connecting to Wi-Fi network");
-  wifi::global_wifi_component->clear_sta();
+  this->connecting_sta_ = {};
 }
 
 }  // namespace esphome::improv_serial

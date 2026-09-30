@@ -104,7 +104,7 @@ class NixPlus : public Component, public uart::UARTDevice {
   void set_display_power(bool on);
   void set_backlight(bool is_on, uint8_t r, uint8_t g, uint8_t b, uint8_t brightness);
   void set_rgb_color(uint8_t r, uint8_t g, uint8_t b, uint8_t brightness = 255);
-  void set_backlight_cycling(uint8_t mode);
+  void set_backlight_cycling(uint8_t mode, uint8_t brightness = 255);
   void revert_lights();
   void apply_manual_lights();
   void schedule_state_confirmation();
@@ -113,6 +113,7 @@ class NixPlus : public Component, public uart::UARTDevice {
   void sync_time_to_clock();
   void sync_time_to_clock(ESPTime time);
   void trigger_time_sync();
+  void set_timezone(const std::string &tz_str);
 
   // Timer Controls (Opcode 0x20)
   void start_timer(uint32_t seconds);
@@ -161,6 +162,8 @@ class NixPlus : public Component, public uart::UARTDevice {
   uint8_t last_r_val_{255};
   uint8_t last_b_val_{255};
   int8_t active_backlight_effect_{-1}; // -1 = solid colour, 0-5 = cycle modes
+  uint8_t last_cycling_brightness_val_{255};
+  bool last_cycling_brightness_valid_{false};
 
   time::RealTimeClock *time_{nullptr};
   switch_::Switch *sntp_switch_{nullptr};
