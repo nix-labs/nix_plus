@@ -17,6 +17,10 @@ void ImprovSerialComponent::setup() {
 
   if (wifi::global_wifi_component != nullptr && wifi::global_wifi_component->is_connected()) {
     this->state_ = improv::STATE_PROVISIONED;
+  } else if (wifi::global_wifi_component != nullptr && wifi::global_wifi_component->has_sta() &&
+             !wifi::global_wifi_component->get_sta().get_ssid().empty()) {
+    this->state_ = improv::STATE_PROVISIONING;
+    this->set_timeout("wifi-connect-timeout", 30000, [this]() { this->on_wifi_connect_timeout_(); });
   } else {
     this->state_ = improv::STATE_AUTHORIZED;
     if (wifi::global_wifi_component != nullptr && !wifi::global_wifi_component->is_disabled()) {
@@ -52,7 +56,12 @@ void ImprovSerialComponent::loop() {
         this->set_state_(improv::STATE_PROVISIONED);
       }
     } else if (!wifi::global_wifi_component->is_disabled() && this->state_ == improv::STATE_PROVISIONED) {
-      this->set_state_(improv::STATE_AUTHORIZED);
+      if (wifi::global_wifi_component->has_sta() && !wifi::global_wifi_component->get_sta().get_ssid().empty()) {
+        this->set_state_(improv::STATE_PROVISIONING);
+        this->set_timeout("wifi-connect-timeout", 30000, [this]() { this->on_wifi_connect_timeout_(); });
+      } else {
+        this->set_state_(improv::STATE_AUTHORIZED);
+      }
     }
   }
 }
@@ -202,8 +211,13 @@ bool ImprovSerialComponent::parse_improv_payload_(improv::ImprovCommand &command
       }
       if (wifi::global_wifi_component != nullptr && wifi::global_wifi_component->is_connected()) {
         this->state_ = improv::STATE_PROVISIONED;
-      } else if (this->state_ != improv::STATE_PROVISIONING) {
-        this->state_ = improv::STATE_AUTHORIZED;
+      } else if (this->state_ != improv::STATE_PROVISIONING && this->state_ != improv::STATE_AUTHORIZED) {
+        if (wifi::global_wifi_component != nullptr && wifi::global_wifi_component->has_sta() &&
+            !wifi::global_wifi_component->get_sta().get_ssid().empty()) {
+          this->state_ = improv::STATE_PROVISIONING;
+        } else {
+          this->state_ = improv::STATE_AUTHORIZED;
+        }
       }
       this->send_current_state_(this->state_);
       if (this->state_ == improv::STATE_PROVISIONED) {
@@ -280,6 +294,9 @@ void ImprovSerialComponent::on_wifi_connect_timeout_() {
   this->set_state_(improv::STATE_AUTHORIZED);
   ESP_LOGW(TAG, "Timed out while connecting to Wi-Fi network");
   this->connecting_sta_ = {};
+  if (wifi::global_wifi_component != nullptr && !wifi::global_wifi_component->is_disabled()) {
+    wifi::global_wifi_component->start_scanning();
+  }
 }
 
 }  // namespace esphome::improv_serial

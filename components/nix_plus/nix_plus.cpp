@@ -1833,6 +1833,10 @@ void NixPlus::process_line(const std::string &line) {
     if (wifi::global_wifi_component != nullptr && wifi::global_wifi_component->is_connected()) {
       this->write_str("ACTIVE\r\n");
       ESP_LOGI(TAG, "Replied ACTIVE to base STATUS? probe");
+    } else if (wifi::global_wifi_component != nullptr && wifi::global_wifi_component->has_sta() &&
+               !wifi::global_wifi_component->get_sta().get_ssid().empty()) {
+      this->write_str("CONNECTING\r\n");
+      ESP_LOGI(TAG, "Replied CONNECTING to base STATUS? probe");
     } else {
       this->write_str("STARTING\r\n");
       ESP_LOGI(TAG, "Replied STARTING to base STATUS? probe");
