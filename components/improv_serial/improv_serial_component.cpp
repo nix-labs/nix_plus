@@ -180,7 +180,6 @@ bool ImprovSerialComponent::parse_improv_payload_(improv::ImprovCommand &command
 
       // Match known AP from previous scan to supply BSSID and Channel for instant FAST_SCAN
       if (wifi::global_wifi_component != nullptr) {
-        wifi::ScanResultsLock lock(wifi::global_wifi_component);
         for (const auto &res : wifi::global_wifi_component->get_scan_result()) {
           if (res.get_ssid() == command.ssid) {
             this->connecting_sta_.set_bssid(res.get_bssid());
