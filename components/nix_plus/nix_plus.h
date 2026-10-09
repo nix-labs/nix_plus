@@ -205,6 +205,8 @@ class NixPlus : public Component, public uart::UARTDevice {
   uint32_t last_backlight_settings_poll_{0};
   bool manual_backlight_active_{false};
   uint8_t cached_time_screen_colour_{0};
+  uint8_t cached_clock_brightness_{0};
+  bool clock_brightness_valid_{false};
   uint8_t cached_misc_opt2_{0};
   uint8_t cached_custom_g_{0};
   uint8_t cached_custom_r_{0};

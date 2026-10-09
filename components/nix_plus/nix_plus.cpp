@@ -927,9 +927,8 @@ void NixPlus::set_backlight_cycling(uint8_t mode, uint8_t brightness) {
   frame[6] = screen_byte; // Time screen colour & brightness (origBright = val)
   frame[7] = screen_byte; // Date screen colour & brightness
   frame[8] = screen_byte; // Temperature screen colour & brightness
-  frame[9] = 1;           // Save 1: Apply screen colours, brightness, and miscOptions2 to clock
+  frame[9] = 0;           // Save 0: Temporary override in RAM, do NOT write to flash!
   frame[0x10] = misc2;    // Enable LED cycle (bit 3 = 1) with mode (0-5)
-
   // Apply firmware's configured colour offset / shift from cached miscOptions4 (bits 7-6)
   if (clock_settings_valid_) {
     uint8_t fw_shift = (clock_settings_[6] >> 6) & 0x03;
@@ -937,11 +936,11 @@ void NixPlus::set_backlight_cycling(uint8_t mode, uint8_t brightness) {
   } else {
     frame[0x11] = 0x00;
   }
-  frame[0x13] = 0xFF; // Out of range tube brightness to skip Group E
+  frame[0x13] = 0xFF;     // Out of range tube brightness to skip Group E
   frame[0x14] = 0;
 
   queue_command(frame, 64, 0x08, 3);
-  ESP_LOGI(TAG, "Queued RGB Backlight cycling effect: mode %u, brightness %u (val=%u, screenByte=0x%02X, misc2=0x%02X, Shift=0x%02X)",
+  ESP_LOGI(TAG, "Queued RGB Backlight cycling effect (temporary in RAM): mode %u, brightness %u (val=%u, screenByte=0x%02X, misc2=0x%02X, shift=0x%02X)",
            safe_mode, brightness, val, screen_byte, misc2, frame[0x11]);
 }
 
@@ -957,9 +956,9 @@ void NixPlus::revert_lights() {
   frame[3] = 0;
   frame[4] = 0;
   frame[5] = 0x00; // Revert LED colour to programmed value
+  frame[9] = 0x00; // Group B Save = 0
   frame[0x10] = 0x00; // Clear cycle override
-  uint8_t fw_shift = (clock_settings_[6] >> 6) & 0x03;
-  frame[0x11] = 0x80 | fw_shift; // Restore firmware shift
+  frame[0x11] = 0x00; // Do not apply shift change (keep flash untouched)
   frame[0x13] = 0xFF; // Out of range to skip setting temporary brightness level
   frame[0x14] = 5; // Revert display brightness to programmed values
   queue_command(frame, 64, 0x08, 3);
@@ -968,7 +967,7 @@ void NixPlus::revert_lights() {
   last_rgb_valid_ = false;
   active_backlight_effect_ = -1;
   last_cycling_brightness_valid_ = false;
-  ESP_LOGI(TAG, "Queued revert lights to hardware defaults (Save=5, Save=0, Shift=0x%02X)", frame[0x11]);
+  ESP_LOGI(TAG, "Queued revert lights to hardware defaults (Save=5, Save=0)");
 
   // Turn off the two light components in ESPHome UI to reflect hardware auto control
   if (display_light_state_ != nullptr && display_light_state_->remote_values.is_on()) {
@@ -988,6 +987,7 @@ void NixPlus::revert_lights() {
 
   this->set_timeout("sync_after_revert", 300, [this]() {
     this->request_sensors();
+    this->read_backlight_settings();
   });
 }
 
@@ -1536,6 +1536,7 @@ void NixPlus::process_binary_frame(const uint8_t *data, size_t len) {
     uint8_t custom_r = data[3];
     uint8_t custom_b = data[4];
     uint8_t time_screen_colour = data[6];
+    uint8_t clock_brightness = data[10];
     uint8_t misc_opt2 = data[16];
     bool cycler_enabled = (misc_opt2 & 0x08) != 0;
     uint8_t cycler_mode = misc_opt2 & 0x07;
@@ -1544,6 +1545,8 @@ void NixPlus::process_binary_frame(const uint8_t *data, size_t len) {
     if (!backlight_settings_valid_) {
       initial_cycler_mode_ = new_cycler_mode;
       cached_time_screen_colour_ = time_screen_colour;
+      cached_clock_brightness_ = clock_brightness;
+      clock_brightness_valid_ = true;
       cached_misc_opt2_ = misc_opt2;
       cached_custom_g_ = custom_g;
       cached_custom_r_ = custom_r;
@@ -1551,24 +1554,32 @@ void NixPlus::process_binary_frame(const uint8_t *data, size_t len) {
       backlight_settings_valid_ = true;
       clock_settings_[6] = data[0x0D];
       clock_settings_valid_ = true;
-      ESP_LOGI(TAG, "Clock backlight settings cached (0x09): time_colour=0x%02X, cycler=%s, mode=%u, misc4=0x%02X",
-               time_screen_colour, cycler_enabled ? "ON" : "OFF", cycler_mode, data[0x0D]);
+      ESP_LOGI(TAG, "Clock backlight settings cached (0x09): time_colour=0x%02X, br=0x%02X, cycler=%s, mode=%u, misc4=0x%02X",
+               time_screen_colour, clock_brightness, cycler_enabled ? "ON" : "OFF", cycler_mode, data[0x0D]);
     } else {
+      uint8_t misc_opt4 = data[0x0D];
       bool settings_changed_externally = (time_screen_colour != cached_time_screen_colour_ ||
+                                          clock_brightness != cached_clock_brightness_ ||
                                           misc_opt2 != cached_misc_opt2_ ||
+                                          misc_opt4 != clock_settings_[6] ||
                                           custom_g != cached_custom_g_ ||
                                           custom_r != cached_custom_r_ ||
                                           custom_b != cached_custom_b_);
       if (settings_changed_externally) {
-        ESP_LOGI(TAG, "Clock backlight settings changed externally: time_colour=0x%02X (was 0x%02X), misc2=0x%02X (was 0x%02X) -> releasing manual backlight override",
-                 time_screen_colour, cached_time_screen_colour_, misc_opt2, cached_misc_opt2_);
+        ESP_LOGI(TAG, "Clock settings changed externally: time_colour=0x%02X (was 0x%02X), br=0x%02X (was 0x%02X), misc2=0x%02X (was 0x%02X), misc4=0x%02X (was 0x%02X)",
+                 time_screen_colour, cached_time_screen_colour_, clock_brightness, cached_clock_brightness_, misc_opt2, cached_misc_opt2_, misc_opt4, clock_settings_[6]);
         cached_time_screen_colour_ = time_screen_colour;
+        cached_clock_brightness_ = clock_brightness;
         cached_misc_opt2_ = misc_opt2;
+        clock_settings_[6] = misc_opt4;
         cached_custom_g_ = custom_g;
         cached_custom_r_ = custom_r;
         cached_custom_b_ = custom_b;
 
-        if (manual_backlight_active_) {
+        if (!is_automated_mode()) {
+          ESP_LOGI(TAG, "Releasing manual override -> returning to clock auto brightness");
+          revert_lights();
+        } else if (manual_backlight_active_) {
           manual_backlight_active_ = false;
           uint8_t rel_frame[64];
           std::memset(rel_frame, 0, sizeof(rel_frame));
@@ -1829,6 +1840,19 @@ std::string NixPlus::get_current_ip_str() {
 void NixPlus::process_line(const std::string &line) {
   ESP_LOGD(TAG, "Received UART ASCII line: '%s'", line.c_str());
 
+  if (line.find("AUTOBRIGHT:1") != std::string::npos ||
+      line.find("AUTOBRIGHT:ON") != std::string::npos ||
+      (line.find("AUTOBRIGHT") != std::string::npos && line.find("AUTOBRIGHT:0") == std::string::npos)) {
+    ESP_LOGI(TAG, "Clock signaled surrender of manual control via hardware button -> turning Auto Brightness ON");
+    if (!is_automated_mode()) {
+      revert_lights();
+    }
+    this->set_timeout("sync_after_button_event", 300, [this]() {
+      read_backlight_settings();
+    });
+    return;
+  }
+
   if (line.find("STATUS?") != std::string::npos) {
     if (wifi::global_wifi_component != nullptr && wifi::global_wifi_component->is_connected()) {
       this->write_str("ACTIVE\r\n");
@@ -2070,6 +2094,7 @@ void NixPlus::loop() {
       last_ascii_rx_ms_ = now;
       // Immediate match for known commands that the PIC32 sends without trailing newline
       if (line_buffer_ == "STATUS?" ||
+          line_buffer_ == "AUTOBRIGHT:1" ||
           line_buffer_ == "WIFINETIP?" ||
           line_buffer_ == "WIFINETP?" ||
           line_buffer_ == "WIFINETINFO?" ||

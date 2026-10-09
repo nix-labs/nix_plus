@@ -34,14 +34,11 @@ nix_plus:
     id: clock_model_sensor
     web_server:
       sorting_group_id: sorting_system
-      sorting_weight: 0
+      sorting_weight: 1
   ip_address:
     name: "IP Address"
     id: clock_ip_sensor
-    disabled_by_default: true
-    web_server:
-      sorting_group_id: sorting_system
-      sorting_weight: 1
+    internal: true
   display:
     name: "Display"
     id: clock_display
