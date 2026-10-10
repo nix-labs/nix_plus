@@ -88,13 +88,8 @@ light::LightTraits NixPlusDisplayLight::get_traits() {
 }
 
 void NixPlusDisplayLight::write_state(light::LightState *state) {
-  if (parent_ != nullptr && parent_->is_handshake_completed() && parent_->is_initial_sync_done()) {
+  if (parent_ != nullptr && parent_->is_handshake_completed() && parent_->is_initial_sync_done() && !parent_->is_in_rollback()) {
     bool is_on = state->current_values.is_on();
-    // In automated mode, light components are marked OFF in UI to indicate clock auto control.
-    // Do not forward OFF to the base clock hardware when in automated mode.
-    if (parent_->is_automated_mode() && !is_on) {
-      return;
-    }
     float brightness = state->current_values.get_brightness();
     parent_->set_display_light(is_on, brightness);
   }
@@ -108,14 +103,10 @@ light::LightTraits NixPlusLight::get_traits() {
 }
 
 void NixPlusLight::write_state(light::LightState *state) {
-  if (parent_ != nullptr && parent_->is_handshake_completed() && parent_->is_initial_sync_done()) {
+  if (parent_ != nullptr && parent_->is_handshake_completed() && parent_->is_initial_sync_done() && !parent_->is_in_rollback()) {
     bool is_on = state->current_values.is_on();
-    // In automated mode, light components are marked OFF in UI to indicate clock auto control.
-    // Do not forward OFF to the base clock hardware when in automated mode.
-    if (parent_->is_automated_mode() && !is_on) {
-      return;
-    }
     if (!is_on) {
+      last_effect_ = "None";
       parent_->set_backlight(false, 0, 0, 0, 0);
       return;
     }
@@ -124,6 +115,25 @@ void NixPlusLight::write_state(light::LightState *state) {
     uint8_t br_byte = static_cast<uint8_t>(std::clamp(roundf(brightness * 255.0f), 0.0f, 255.0f));
 
     std::string effect = state->get_effect_name().str();
+    float r_val = state->current_values.get_red();
+    float g_val = state->current_values.get_green();
+    float b_val = state->current_values.get_blue();
+
+    bool color_changed = (last_r_ >= 0.0f && (fabsf(r_val - last_r_) > 0.01f ||
+                                              fabsf(g_val - last_g_) > 0.01f ||
+                                              fabsf(b_val - last_b_) > 0.01f));
+
+    if (color_changed && effect != "None" && !effect.empty()) {
+      // User explicitly picked a solid color while an effect was active -> clear effect
+      effect = "None";
+      parent_->clear_backlight_effect_later();
+    }
+
+    last_effect_ = effect;
+    last_r_ = r_val;
+    last_g_ = g_val;
+    last_b_ = b_val;
+
     if (effect == "Colour Cycle - Extremely Slow") {
       parent_->set_backlight_cycling(0, br_byte);
     } else if (effect == "Colour Cycle - Extra Slow") {
@@ -137,8 +147,9 @@ void NixPlusLight::write_state(light::LightState *state) {
     } else if (effect == "Colour Cycle - Extra Fast") {
       parent_->set_backlight_cycling(5, br_byte);
     } else {
-      float r_f, g_f, b_f;
-      state->current_values_as_rgb(&r_f, &g_f, &b_f);
+      float r_f = r_val * brightness;
+      float g_f = g_val * brightness;
+      float b_f = b_val * brightness;
 
       uint8_t r = static_cast<uint8_t>(std::clamp(roundf(r_f * 31.0f), 0.0f, 31.0f));
       uint8_t g = static_cast<uint8_t>(std::clamp(roundf(g_f * 31.0f), 0.0f, 31.0f));
@@ -156,6 +167,7 @@ void NixPlusLight::write_state(light::LightState *state) {
 
 // NixPlus Component implementation
 void NixPlus::setup() {
+  ESP_LOGI(TAG, "ESP32 Boot Reset Reason: %d", static_cast<int>(esp_reset_reason()));
   ESP_LOGCONFIG(TAG, "Setting up NIX+ Universal Network Component...");
   if (wifi::global_wifi_component != nullptr && wifi::global_wifi_component->has_sta()) {
     const auto &sta = wifi::global_wifi_component->get_sta();
@@ -238,35 +250,19 @@ void NixPlus::queue_command(const uint8_t *data, size_t len, uint8_t expected_re
   tx.attempts = 0;
   tx.last_send_ms = 0;
   tx.timeout_ms = 250;
-  // Coalesce / deduplicate rapid successive settings updates (opcode 0x08: brightness/color/cycle)
-  // If an unstarted transaction with the same sub-feature is already waiting in the queue,
+  // Coalesce / deduplicate rapid successive settings updates (opcode 0x08)
+  // If an unstarted transaction is already waiting in the queue,
   // update its payload in-place instead of queueing backlogged commands.
   if (tx.opcode == 0x08 && tx_queue_.size() > 1) {
     for (size_t i = 1; i < tx_queue_.size(); i++) {
       auto &pending = tx_queue_[i];
       if (pending.attempts == 0 && pending.opcode == 0x08) {
-        // Match display brightness command: data[0x14] == 3 and data[2] == 0xFF
-        if (tx.data[0x14] == 3 && tx.data[2] == 0xFF && pending.data[0x14] == 3 && pending.data[2] == 0xFF) {
+        // Coalesce manual light updates (data[0x14] != 5) so the latest state replaces earlier unstarted ones
+        if (tx.data[0x14] != 5 && pending.data[0x14] != 5) {
           std::memcpy(pending.data, tx.data, sizeof(pending.data));
           pending.expected_response = tx.expected_response;
           pending.max_attempts = tx.max_attempts;
-          ESP_LOGD(TAG, "Coalesced pending display brightness update in TX queue");
-          return;
-        }
-        // Match RGB backlight command: data[5] == 1
-        if (tx.data[5] == 1 && pending.data[5] == 1) {
-          std::memcpy(pending.data, tx.data, sizeof(pending.data));
-          pending.expected_response = tx.expected_response;
-          pending.max_attempts = tx.max_attempts;
-          ESP_LOGD(TAG, "Coalesced pending RGB backlight update in TX queue");
-          return;
-        }
-        // Match RGB backlight cycling command: data[0x10] & 0x08
-        if ((tx.data[0x10] & 0x08) && (pending.data[0x10] & 0x08)) {
-          std::memcpy(pending.data, tx.data, sizeof(pending.data));
-          pending.expected_response = tx.expected_response;
-          pending.max_attempts = tx.max_attempts;
-          ESP_LOGD(TAG, "Coalesced pending RGB backlight cycling update in TX queue");
+          ESP_LOGD(TAG, "Coalesced pending 0x08 lights update in TX queue");
           return;
         }
       }
@@ -320,6 +316,7 @@ void NixPlus::process_tx_queue() {
 }
 
 void NixPlus::rollback_unconfirmed_state(const CommandTransaction &tx) {
+  in_rollback_ = true;
   if (tx.opcode == 0x08) {
     if (tx.data[0x14] == 3) {
       // Display brightness failed -> roll back to confirmed_display_level_
@@ -334,7 +331,7 @@ void NixPlus::rollback_unconfirmed_state(const CommandTransaction &tx) {
         ESP_LOGW(TAG, "Rolled back display brightness to confirmed level %u/7", confirmed_display_level_);
       }
     }
-    if (tx.data[5] == 1 || tx.data[5] == 0) {
+    if ((tx.data[5] & ~0x80) == 1 || (tx.data[5] == 0 && tx.data[0x14] != 5 && (tx.data[0x10] & 0x08) == 0)) {
       // Backlight failed -> roll back to confirmed backlight state
       if (backlight_light_state_ != nullptr) {
         backlight_light_state_->current_values.set_state(confirmed_backlight_power_);
@@ -370,6 +367,7 @@ void NixPlus::rollback_unconfirmed_state(const CommandTransaction &tx) {
       }
     }
   }
+  in_rollback_ = false;
 }
 
 // Opcode 0x10: Read Device Info (Handshake)
@@ -705,10 +703,14 @@ void NixPlus::set_display_light(bool is_on, float brightness) {
 
   bool was_auto = (ambient_mode_switch_ != nullptr && ambient_mode_switch_->state);
   if (was_auto) {
-    ambient_mode_switch_->publish_state(false);
+    if (!in_mode_transition_) {
+      in_mode_transition_ = true;
+      ambient_mode_switch_->publish_state(false);
+      in_mode_transition_ = false;
+    }
   }
 
-  if (!was_auto && display_initialized_ && is_on == display_power_state_ && level == display_brightness_level_) {
+  if (!was_auto && !applying_manual_pair_ && display_initialized_ && is_on == display_power_state_ && level == display_brightness_level_) {
     return;
   }
   bool power_changed = !display_initialized_ || (is_on != display_power_state_);
@@ -733,6 +735,9 @@ void NixPlus::set_display_light(bool is_on, float brightness) {
 
   // Display ON: only send wake packet if power actually changed from OFF to ON
   if (power_changed) {
+    this->cancel_timeout("wake_finish");
+    this->cancel_timeout("backlight_after_wake");
+
     uint8_t frame[64];
     std::memset(frame, 0, sizeof(frame));
     frame[0] = 0x20;
@@ -742,55 +747,26 @@ void NixPlus::set_display_light(bool is_on, float brightness) {
 
     last_brightness_valid_ = false;
 
-    // Wait for clock base soft starter to complete before sending brightness
+    // Wait for clock base soft starter to complete before sending unified manual lights
     this->set_timeout("wake_finish", 150, [this, level]() {
-      set_display_brightness(level);
-
-      // Re-assert backlight settings if backlight is currently on
-      if (backlight_light_state_ != nullptr && backlight_light_state_->remote_values.is_on()) {
-        if (active_backlight_effect_ >= 0) {
-          float br = backlight_light_state_->remote_values.get_brightness();
-          uint8_t br_byte = static_cast<uint8_t>(std::clamp(roundf(br * 255.0f), 0.0f, 255.0f));
-          last_cycling_brightness_valid_ = false;
-          set_backlight_cycling(active_backlight_effect_, br_byte);
-        } else if (last_r_val_ > 0 || last_g_val_ > 0 || last_b_val_ > 0) {
-          last_rgb_valid_ = false; // ensure set_rgb_color actually transmits to clock
-          set_rgb_color(last_r_val_, last_g_val_, last_b_val_, 255);
-        }
-      }
+      send_unified_manual_lights(level);
     });
   } else {
-    set_display_brightness(level);
+    send_unified_manual_lights(level);
   }
 }
 
 void NixPlus::set_display_brightness(uint8_t level) {
   bool was_auto = (ambient_mode_switch_ != nullptr && ambient_mode_switch_->state);
   if (was_auto) {
-    ambient_mode_switch_->publish_state(false);
+    if (!in_mode_transition_) {
+      in_mode_transition_ = true;
+      ambient_mode_switch_->publish_state(false);
+      in_mode_transition_ = false;
+    }
   }
 
-  uint8_t safe_level = std::min(static_cast<uint8_t>(7), level);
-  if (!was_auto && last_brightness_valid_ && last_brightness_level_ == safe_level) {
-    return;
-  }
-  last_brightness_level_ = safe_level;
-  last_brightness_valid_ = true;
-
-  uint8_t frame[64];
-  std::memset(frame, 0, sizeof(frame));
-  frame[0] = 0x08;
-  // Per documentation, setting out-of-range Green (0xFF) safely skips Group A (custom colour),
-  // preventing accidental clearing or alteration of backlight settings.
-  frame[2] = 0xFF;
-  frame[3] = 0xFF;
-  frame[4] = 0xFF;
-  frame[5] = 0xFF;
-  frame[0x13] = safe_level; // Tube brightness level 0..7
-  frame[0x14] = 3; // Apply temporary brightness level for both Day and Night (RAM only, no flash save)
-
-  queue_command(frame, 64, 0x08, 3);
-  ESP_LOGI(TAG, "Queued temporary display brightness: %u/7 (no flash save)", safe_level);
+  send_unified_manual_lights(level);
 }
 
 void NixPlus::set_display_power(bool on) {
@@ -813,13 +789,17 @@ void NixPlus::set_display_power(bool on) {
 void NixPlus::set_backlight(bool is_on, uint8_t r, uint8_t g, uint8_t b, uint8_t brightness) {
   bool was_auto = (ambient_mode_switch_ != nullptr && ambient_mode_switch_->state);
   if (was_auto) {
-    ambient_mode_switch_->publish_state(false);
+    if (!in_mode_transition_) {
+      in_mode_transition_ = true;
+      ambient_mode_switch_->publish_state(false);
+      in_mode_transition_ = false;
+    }
   }
 
   if (!is_on) {
     this->cancel_timeout("backlight_after_wake");
     manual_backlight_active_ = false;
-    if (was_auto || backlight_power_state_ || !backlight_initialized_) {
+    if (was_auto || applying_manual_pair_ || backlight_power_state_ || !backlight_initialized_) {
       backlight_power_state_ = false;
       backlight_initialized_ = true;
       active_backlight_effect_ = -1;
@@ -837,7 +817,11 @@ void NixPlus::set_backlight(bool is_on, uint8_t r, uint8_t g, uint8_t b, uint8_t
 void NixPlus::set_rgb_color(uint8_t r, uint8_t g, uint8_t b, uint8_t brightness) {
   bool was_auto = (ambient_mode_switch_ != nullptr && ambient_mode_switch_->state);
   if (was_auto) {
-    ambient_mode_switch_->publish_state(false);
+    if (!in_mode_transition_) {
+      in_mode_transition_ = true;
+      ambient_mode_switch_->publish_state(false);
+      in_mode_transition_ = false;
+    }
     last_rgb_valid_ = false;
   }
 
@@ -851,7 +835,9 @@ void NixPlus::set_rgb_color(uint8_t r, uint8_t g, uint8_t b, uint8_t brightness)
     b_val = static_cast<uint8_t>(std::clamp(roundf(b_val * b_scale), 0.0f, 31.0f));
   }
 
-  if (!was_auto && active_backlight_effect_ == -1 && last_rgb_valid_ && last_g_val_ == g_val && last_r_val_ == r_val && last_b_val_ == b_val) {
+  if (manual_backlight_active_ && !was_auto && !applying_manual_pair_ &&
+      active_backlight_effect_ == -1 && last_rgb_valid_ &&
+      last_g_val_ == g_val && last_r_val_ == r_val && last_b_val_ == b_val) {
     return;
   }
   active_backlight_effect_ = -1;
@@ -876,18 +862,24 @@ void NixPlus::set_rgb_color(uint8_t r, uint8_t g, uint8_t b, uint8_t brightness)
   frame[5] = 0x01;  // Save 1: Temporary custom colour in RAM (persists via led_forcedColour without flash wear or timeout)
   frame[0x10] = 0x00; // Disable LED cycle
   frame[0x11] = 0x80; // LED Shift = 0 / Off (MSB=1 applies this). Disables firmware colour offset for static colours.
-  frame[0x13] = 0xFF; // Out of range tube brightness to skip Group E
-  frame[0x14] = 0;  // Group E Save = 0 (no effect on display brightness)
+  uint8_t disp_lvl = (display_brightness_level_ <= 7) ? display_brightness_level_ : 7;
+  frame[0x13] = disp_lvl;
+  frame[0x14] = 3;  // Apply temporary brightness level for Day and Night
 
   queue_command(frame, 64, 0x08, 3);
-  ESP_LOGD(TAG, "Queued RGB Backlight set (Save=1 temporary in RAM): R=%u, G=%u, B=%u",
-           r_val, g_val, b_val);
+  ESP_LOGI(TAG, "Queued RGB Backlight set (Save=1 temporary in RAM): R=%u, G=%u, B=%u, Tube=%u/7",
+           r_val, g_val, b_val, disp_lvl);
 }
 
 void NixPlus::set_backlight_cycling(uint8_t mode, uint8_t brightness) {
   manual_backlight_active_ = false;
-  if (ambient_mode_switch_ != nullptr && ambient_mode_switch_->state) {
-    ambient_mode_switch_->publish_state(false);
+  bool was_auto = (ambient_mode_switch_ != nullptr && ambient_mode_switch_->state);
+  if (was_auto) {
+    if (!in_mode_transition_) {
+      in_mode_transition_ = true;
+      ambient_mode_switch_->publish_state(false);
+      in_mode_transition_ = false;
+    }
   }
 
   backlight_power_state_ = true;
@@ -897,7 +889,8 @@ void NixPlus::set_backlight_cycling(uint8_t mode, uint8_t brightness) {
   float b_scale = brightness / 255.0f;
   uint8_t val = static_cast<uint8_t>(std::clamp(roundf(31.0f * b_scale), 1.0f, 31.0f));
 
-  if (active_backlight_effect_ == static_cast<int8_t>(safe_mode) &&
+  if (!was_auto && !applying_manual_pair_ &&
+      active_backlight_effect_ == static_cast<int8_t>(safe_mode) &&
       last_cycling_brightness_valid_ && last_cycling_brightness_val_ == val) {
     return;
   }
@@ -936,18 +929,20 @@ void NixPlus::set_backlight_cycling(uint8_t mode, uint8_t brightness) {
   } else {
     frame[0x11] = 0x00;
   }
-  frame[0x13] = 0xFF;     // Out of range tube brightness to skip Group E
-  frame[0x14] = 0;
+  uint8_t disp_lvl = (display_brightness_level_ <= 7) ? display_brightness_level_ : 7;
+  frame[0x13] = disp_lvl;
+  frame[0x14] = 3;        // Maintain active display brightness
 
   queue_command(frame, 64, 0x08, 3);
-  ESP_LOGI(TAG, "Queued RGB Backlight cycling effect (temporary in RAM): mode %u, brightness %u (val=%u, screenByte=0x%02X, misc2=0x%02X, shift=0x%02X)",
-           safe_mode, brightness, val, screen_byte, misc2, frame[0x11]);
+  ESP_LOGI(TAG, "Queued RGB Backlight cycling effect (temporary in RAM): mode %u, brightness %u (val=%u, screenByte=0x%02X, misc2=0x%02X, shift=0x%02X), Tube=%u/7",
+           safe_mode, brightness, val, screen_byte, misc2, frame[0x11], disp_lvl);
 }
 
 void NixPlus::revert_lights() {
-  if (!initial_sync_done_) {
+  if (!initial_sync_done_ || in_mode_transition_) {
     return;
   }
+  in_mode_transition_ = true;
   manual_backlight_active_ = false;
   uint8_t frame[64];
   std::memset(frame, 0, sizeof(frame));
@@ -962,57 +957,157 @@ void NixPlus::revert_lights() {
   frame[0x13] = 0xFF; // Out of range to skip setting temporary brightness level
   frame[0x14] = 5; // Revert display brightness to programmed values
   queue_command(frame, 64, 0x08, 3);
+  display_brightness_level_ = 255;
   last_brightness_level_ = 255;
   last_brightness_valid_ = false;
   last_rgb_valid_ = false;
+  last_r_val_ = 255;
+  last_g_val_ = 255;
+  last_b_val_ = 255;
   active_backlight_effect_ = -1;
   last_cycling_brightness_valid_ = false;
+  last_cycling_brightness_val_ = 255;
   ESP_LOGI(TAG, "Queued revert lights to hardware defaults (Save=5, Save=0)");
-
-  // Turn off the two light components in ESPHome UI to reflect hardware auto control
-  if (display_light_state_ != nullptr && display_light_state_->remote_values.is_on()) {
-    display_light_state_->current_values.set_state(false);
-    display_light_state_->remote_values = display_light_state_->current_values;
-    display_light_state_->publish_state();
-  }
-  if (backlight_light_state_ != nullptr && backlight_light_state_->remote_values.is_on()) {
-    backlight_light_state_->current_values.set_state(false);
-    backlight_light_state_->remote_values = backlight_light_state_->current_values;
-    backlight_light_state_->publish_state();
-  }
 
   if (ambient_mode_switch_ != nullptr && !ambient_mode_switch_->state) {
     ambient_mode_switch_->publish_state(true);
   }
 
+  in_mode_transition_ = false;
+
   this->set_timeout("sync_after_revert", 300, [this]() {
     this->request_sensors();
-    this->read_backlight_settings();
   });
 }
 
-void NixPlus::apply_manual_lights() {
-  if (!initial_sync_done_) {
-    return;
+void NixPlus::send_unified_manual_lights(uint8_t disp_level) {
+  uint8_t safe_level = std::min(static_cast<uint8_t>(7), disp_level);
+  last_brightness_level_ = safe_level;
+  last_brightness_valid_ = true;
+
+  uint8_t frame[64];
+  std::memset(frame, 0, sizeof(frame));
+  frame[0] = 0x08;
+
+  // Group E: Tube brightness
+  frame[0x13] = safe_level;
+  frame[0x14] = 3; // Day and night temporary brightness (no flash save)
+
+  // Backlight configuration (Group A / Group B)
+  bool bl_on = (backlight_light_state_ != nullptr && backlight_light_state_->remote_values.is_on());
+  std::string effect = (backlight_light_state_ != nullptr) ? backlight_light_state_->get_effect_name().str() : "None";
+
+  if (!bl_on) {
+    // Backlight OFF
+    manual_backlight_active_ = false;
+    backlight_power_state_ = false;
+    backlight_initialized_ = true;
+    active_backlight_effect_ = -1;
+    last_rgb_valid_ = true;
+    last_g_val_ = 0;
+    last_r_val_ = 0;
+    last_b_val_ = 0;
+
+    frame[2] = 0;
+    frame[3] = 0;
+    frame[4] = 0;
+    frame[5] = 0x01; // Set LEDs to 0 in RAM
+    frame[0x10] = 0x00; // Disable cycle
+    frame[0x11] = 0x80; // LED Shift = 0
+  } else if (effect != "None" && !effect.empty()) {
+    // Backlight Cycling Effect
+    manual_backlight_active_ = false;
+    backlight_power_state_ = true;
+    backlight_initialized_ = true;
+
+    uint8_t mode = 0;
+    if (effect == "Colour Cycle - Extremely Slow") mode = 0;
+    else if (effect == "Colour Cycle - Extra Slow") mode = 1;
+    else if (effect == "Colour Cycle - Slow") mode = 2;
+    else if (effect == "Colour Cycle - Medium") mode = 3;
+    else if (effect == "Colour Cycle - Fast") mode = 4;
+    else if (effect == "Colour Cycle - Extra Fast") mode = 5;
+
+    active_backlight_effect_ = static_cast<int8_t>(mode);
+    float br = backlight_light_state_->remote_values.get_brightness();
+    uint8_t val = static_cast<uint8_t>(std::clamp(roundf(31.0f * br), 1.0f, 31.0f));
+    last_cycling_brightness_val_ = val;
+    last_cycling_brightness_valid_ = true;
+    last_rgb_valid_ = false;
+
+    uint8_t col = (cached_time_screen_colour_ & 0x07);
+    if (col == 0) col = 4;
+    uint8_t screen_byte = (val << 3) | col;
+    uint8_t misc2 = 0x08 | (mode & 0x07);
+
+    cached_time_screen_colour_ = screen_byte;
+    cached_misc_opt2_ = misc2;
+
+    frame[2] = 0;
+    frame[3] = 0;
+    frame[4] = 0;
+    frame[5] = 0x00; // Unpause cycler
+    frame[6] = screen_byte;
+    frame[7] = screen_byte;
+    frame[8] = screen_byte;
+    frame[9] = 0;    // RAM only
+    frame[0x10] = misc2;
+    if (clock_settings_valid_) {
+      uint8_t fw_shift = (clock_settings_[6] >> 6) & 0x03;
+      frame[0x11] = 0x80 | fw_shift;
+    } else {
+      frame[0x11] = 0x00;
+    }
+  } else {
+    // Solid RGB Colour
+    backlight_power_state_ = true;
+    backlight_initialized_ = true;
+    active_backlight_effect_ = -1;
+    last_cycling_brightness_valid_ = false;
+
+    float br = backlight_light_state_->remote_values.get_brightness();
+    float r_f = backlight_light_state_->remote_values.get_red() * br;
+    float g_f = backlight_light_state_->remote_values.get_green() * br;
+    float b_f = backlight_light_state_->remote_values.get_blue() * br;
+    uint8_t r = static_cast<uint8_t>(std::clamp(roundf(r_f * 31.0f), 0.0f, 31.0f));
+    uint8_t g = static_cast<uint8_t>(std::clamp(roundf(g_f * 31.0f), 0.0f, 31.0f));
+    uint8_t b = static_cast<uint8_t>(std::clamp(roundf(b_f * 31.0f), 0.0f, 31.0f));
+    if (r_f > 0.001f && r == 0) r = 1;
+    if (g_f > 0.001f && g == 0) g = 1;
+    if (b_f > 0.001f && b == 0) b = 1;
+
+    last_g_val_ = g;
+    last_r_val_ = r;
+    last_b_val_ = b;
+    last_rgb_valid_ = true;
+    manual_backlight_active_ = (r > 0 || g > 0 || b > 0);
+
+    frame[2] = g;
+    frame[3] = r;
+    frame[4] = b;
+    frame[5] = 0x01;  // Temporary custom colour in RAM
+    frame[0x10] = 0x00; // Disable cycle
+    frame[0x11] = 0x80; // LED Shift = 0
   }
-  ESP_LOGI(TAG, "Applying manual lights from ESPHome interface");
 
-  // Restore Display Light component to ON in UI and apply manual brightness
-  if (display_light_state_ != nullptr) {
-    display_light_state_->current_values.set_state(true);
-    display_light_state_->remote_values = display_light_state_->current_values;
-    display_light_state_->publish_state();
+  queue_command(frame, 64, 0x08, 3);
+  ESP_LOGI(TAG, "Queued unified manual lights (0x08): Tube=%u/7, BL_On=%d, BL_RGB=(%u,%u,%u), Effect=%s",
+           safe_level, bl_on, frame[3], frame[2], frame[4], effect.c_str());
+}
 
-    float b = display_light_state_->remote_values.get_brightness();
-    uint8_t level = static_cast<uint8_t>(std::clamp(roundf(b * 7.0f), 0.0f, 7.0f));
-    set_display_brightness(level);
-  }
+void NixPlus::apply_manual_display() {
+  if (display_light_state_ == nullptr) return;
+  bool is_on = display_light_state_->remote_values.is_on();
+  float b = display_light_state_->remote_values.get_brightness();
+  set_display_light(is_on, b);
+}
 
-  // Restore Backlight Light component to ON in UI and apply manual color/effect
-  if (backlight_light_state_ != nullptr) {
-    backlight_light_state_->current_values.set_state(true);
-    backlight_light_state_->remote_values = backlight_light_state_->current_values;
-    backlight_light_state_->publish_state();
+void NixPlus::apply_manual_backlight() {
+  if (backlight_light_state_ == nullptr) return;
+  bool is_on = backlight_light_state_->remote_values.is_on();
+  if (!is_on) {
+    set_backlight(false, 0, 0, 0, 0);
+  } else {
     float br = backlight_light_state_->remote_values.get_brightness();
     uint8_t br_byte = static_cast<uint8_t>(std::clamp(roundf(br * 255.0f), 0.0f, 255.0f));
     std::string effect = backlight_light_state_->get_effect_name().str();
@@ -1029,8 +1124,9 @@ void NixPlus::apply_manual_lights() {
     } else if (effect == "Colour Cycle - Extra Fast") {
       set_backlight_cycling(5, br_byte);
     } else {
-      float r_f, g_f, b_f;
-      backlight_light_state_->current_values_as_rgb(&r_f, &g_f, &b_f);
+      float r_f = backlight_light_state_->remote_values.get_red() * br;
+      float g_f = backlight_light_state_->remote_values.get_green() * br;
+      float b_f = backlight_light_state_->remote_values.get_blue() * br;
       uint8_t r = static_cast<uint8_t>(std::clamp(roundf(r_f * 31.0f), 0.0f, 31.0f));
       uint8_t g = static_cast<uint8_t>(std::clamp(roundf(g_f * 31.0f), 0.0f, 31.0f));
       uint8_t b = static_cast<uint8_t>(std::clamp(roundf(b_f * 31.0f), 0.0f, 31.0f));
@@ -1040,6 +1136,75 @@ void NixPlus::apply_manual_lights() {
       set_rgb_color(r, g, b, 255);
     }
   }
+}
+
+void NixPlus::clear_backlight_effect_later() {
+  this->set_timeout("clear_backlight_effect", 10, [this]() {
+    if (this->backlight_light_state_ != nullptr) {
+      auto call = this->backlight_light_state_->make_call();
+      call.set_effect("None");
+      call.perform();
+    }
+  });
+}
+
+void NixPlus::apply_manual_lights() {
+  if (!initial_sync_done_ || in_mode_transition_) {
+    return;
+  }
+  ESP_LOGI(TAG, "Restoring manual lights from ESPHome interface to previously set values");
+  in_mode_transition_ = true;
+
+  if (display_light_state_ == nullptr) {
+    in_mode_transition_ = false;
+    return;
+  }
+
+  bool is_disp_on = display_light_state_->remote_values.is_on();
+  float disp_b = display_light_state_->remote_values.get_brightness();
+  uint8_t disp_level = static_cast<uint8_t>(std::clamp(roundf(disp_b * 7.0f), 0.0f, 7.0f));
+
+  bool power_changed = !display_initialized_ || (is_disp_on != display_power_state_);
+  display_initialized_ = true;
+  display_power_state_ = is_disp_on;
+  display_brightness_level_ = disp_level;
+
+  if (!is_disp_on) {
+    this->cancel_timeout("wake_finish");
+    this->cancel_timeout("backlight_after_wake");
+
+    uint8_t frame[64];
+    std::memset(frame, 0, sizeof(frame));
+    frame[0] = 0x20;
+    frame[0x10] = 2; // PwrCtl: display off / sleep
+    queue_command(frame, 64, 0x20, 3);
+    ESP_LOGI(TAG, "Queued Display power OFF (0x20)");
+    last_brightness_valid_ = false;
+  } else if (power_changed) {
+    this->cancel_timeout("wake_finish");
+    this->cancel_timeout("backlight_after_wake");
+
+    uint8_t frame[64];
+    std::memset(frame, 0, sizeof(frame));
+    frame[0] = 0x20;
+    frame[0x10] = 3; // PwrCtl: display on / wake
+    queue_command(frame, 64, 0x20, 3);
+    ESP_LOGI(TAG, "Queued Display power ON (0x20)");
+    last_brightness_valid_ = false;
+
+    // Wait 150ms for clock base soft starter to complete before sending unified lights
+    this->set_timeout("wake_finish", 150, [this, disp_level]() {
+      send_unified_manual_lights(disp_level);
+    });
+  } else {
+    send_unified_manual_lights(disp_level);
+  }
+
+  if (ambient_mode_switch_ != nullptr && ambient_mode_switch_->state) {
+    ambient_mode_switch_->publish_state(false);
+  }
+
+  in_mode_transition_ = false;
 }
 
 
@@ -1445,14 +1610,25 @@ void NixPlus::process_binary_frame(const uint8_t *data, size_t len) {
     if (tx.opcode == 0x08) {
       if (tx.data[0x14] == 3) {
         confirmed_display_level_ = tx.data[0x13];
+        ESP_LOGD(TAG, "Transaction 0x08 confirmed display level: %u/7", confirmed_display_level_);
       }
       if ((tx.data[5] & ~0x80) == 1) {
-        confirmed_g_ = tx.data[2];
-        confirmed_r_ = tx.data[3];
-        confirmed_b_ = tx.data[4];
+        // Clock confirms clean active 0-31 GRB values at data[0x30..0x32]
+        confirmed_g_ = data[0x30];
+        confirmed_r_ = data[0x31];
+        confirmed_b_ = data[0x32];
         confirmed_backlight_power_ = (confirmed_r_ > 0 || confirmed_g_ > 0 || confirmed_b_ > 0);
-      } else if (tx.data[5] == 0) {
+        ESP_LOGD(TAG, "Transaction 0x08 confirmed clean backlight: RGB=(%u,%u,%u)",
+                 confirmed_r_, confirmed_g_, confirmed_b_);
+      } else if (tx.data[0x10] & 0x08) {
+        confirmed_backlight_power_ = true;
+        ESP_LOGD(TAG, "Transaction 0x08 confirmed backlight cycler ON");
+      } else if (tx.data[5] == 0 && tx.data[0x14] != 5) {
         confirmed_backlight_power_ = false;
+        confirmed_r_ = 0;
+        confirmed_g_ = 0;
+        confirmed_b_ = 0;
+        ESP_LOGD(TAG, "Transaction 0x08 confirmed backlight power OFF");
       }
     } else if (tx.opcode == 0x20) {
       if (tx.data[0x10] == 2) {
@@ -1532,9 +1708,15 @@ void NixPlus::process_binary_frame(const uint8_t *data, size_t len) {
     }
 
   } else if (opcode == 0x09) {
-    uint8_t custom_g = data[2];
-    uint8_t custom_r = data[3];
-    uint8_t custom_b = data[4];
+    // Read clean 0-31 GRB values from data[0x30..0x32], falling back to data[2..4] for older firmware
+    uint8_t custom_g = data[0x30];
+    uint8_t custom_r = data[0x31];
+    uint8_t custom_b = data[0x32];
+    if (custom_g == 0 && custom_r == 0 && custom_b == 0 && (data[2] > 0 || data[3] > 0 || data[4] > 0)) {
+      custom_g = data[2];
+      custom_r = data[3];
+      custom_b = data[4];
+    }
     uint8_t time_screen_colour = data[6];
     uint8_t clock_brightness = data[10];
     uint8_t misc_opt2 = data[16];
@@ -1554,69 +1736,32 @@ void NixPlus::process_binary_frame(const uint8_t *data, size_t len) {
       backlight_settings_valid_ = true;
       clock_settings_[6] = data[0x0D];
       clock_settings_valid_ = true;
-      ESP_LOGI(TAG, "Clock backlight settings cached (0x09): time_colour=0x%02X, br=0x%02X, cycler=%s, mode=%u, misc4=0x%02X",
-               time_screen_colour, clock_brightness, cycler_enabled ? "ON" : "OFF", cycler_mode, data[0x0D]);
-    } else {
-      uint8_t misc_opt4 = data[0x0D];
-      bool settings_changed_externally = (time_screen_colour != cached_time_screen_colour_ ||
-                                          clock_brightness != cached_clock_brightness_ ||
-                                          misc_opt2 != cached_misc_opt2_ ||
-                                          misc_opt4 != clock_settings_[6] ||
-                                          custom_g != cached_custom_g_ ||
-                                          custom_r != cached_custom_r_ ||
-                                          custom_b != cached_custom_b_);
-      if (settings_changed_externally) {
-        ESP_LOGI(TAG, "Clock settings changed externally: time_colour=0x%02X (was 0x%02X), br=0x%02X (was 0x%02X), misc2=0x%02X (was 0x%02X), misc4=0x%02X (was 0x%02X)",
-                 time_screen_colour, cached_time_screen_colour_, clock_brightness, cached_clock_brightness_, misc_opt2, cached_misc_opt2_, misc_opt4, clock_settings_[6]);
-        cached_time_screen_colour_ = time_screen_colour;
-        cached_clock_brightness_ = clock_brightness;
-        cached_misc_opt2_ = misc_opt2;
-        clock_settings_[6] = misc_opt4;
-        cached_custom_g_ = custom_g;
-        cached_custom_r_ = custom_r;
-        cached_custom_b_ = custom_b;
+      ESP_LOGI(TAG, "Clock backlight settings cached (0x09): time_colour=0x%02X, br=0x%02X, cycler=%s, mode=%u, misc4=0x%02X, clean_RGB=(%u,%u,%u)",
+               time_screen_colour, clock_brightness, cycler_enabled ? "ON" : "OFF", cycler_mode, data[0x0D], custom_r, custom_g, custom_b);
 
-        if (!is_automated_mode()) {
-          ESP_LOGI(TAG, "Releasing manual override -> returning to clock auto brightness");
+      confirmed_backlight_power_ = (new_cycler_mode >= 0 || custom_r > 0 || custom_g > 0 || custom_b > 0);
+      confirmed_r_ = custom_r;
+      confirmed_g_ = custom_g;
+      confirmed_b_ = custom_b;
+
+      if (display_initialized_ && !initial_sync_done_) {
+        initial_sync_done_ = true;
+        if (ambient_mode_switch_ != nullptr && ambient_mode_switch_->state) {
           revert_lights();
-        } else if (manual_backlight_active_) {
-          manual_backlight_active_ = false;
-          uint8_t rel_frame[64];
-          std::memset(rel_frame, 0, sizeof(rel_frame));
-          rel_frame[0] = 0x08;
-          rel_frame[5] = 0x00; // Clear forced colour on clock
-          rel_frame[0x13] = 0xFF;
-          rel_frame[0x14] = 0;
-          queue_command(rel_frame, 64, 0x08, 1);
-        }
-
-        if (new_cycler_mode != active_backlight_effect_) {
-          active_backlight_effect_ = new_cycler_mode;
-          last_cycling_brightness_valid_ = false;
-          bool is_auto = (ambient_mode_switch_ != nullptr && ambient_mode_switch_->state);
-          if (backlight_light_state_ != nullptr && !is_auto) {
-            if (new_cycler_mode >= 0 && new_cycler_mode <= 5) {
-              static const char *const CYCLER_EFFECTS[6] = {
-                "Colour Cycle - Extremely Slow",
-                "Colour Cycle - Extra Slow",
-                "Colour Cycle - Slow",
-                "Colour Cycle - Medium",
-                "Colour Cycle - Fast",
-                "Colour Cycle - Extra Fast"
-              };
-              auto call = backlight_light_state_->make_call();
-              call.set_effect(CYCLER_EFFECTS[new_cycler_mode]);
-              call.set_transition_length(0);
-              call.perform();
-            } else {
-              auto call = backlight_light_state_->make_call();
-              call.set_effect("None");
-              call.set_transition_length(0);
-              call.perform();
-            }
-          }
         }
       }
+    } else {
+      uint8_t misc_opt4 = data[0x0D];
+      cached_time_screen_colour_ = time_screen_colour;
+      cached_clock_brightness_ = clock_brightness;
+      cached_misc_opt2_ = misc_opt2;
+      clock_settings_[6] = misc_opt4;
+      cached_custom_g_ = custom_g;
+      cached_custom_r_ = custom_r;
+      cached_custom_b_ = custom_b;
+      confirmed_r_ = custom_r;
+      confirmed_g_ = custom_g;
+      confirmed_b_ = custom_b;
     }
 
   } else if (opcode == 0x11) {
@@ -1675,21 +1820,14 @@ void NixPlus::process_binary_frame(const uint8_t *data, size_t len) {
       }
     }
 
-    // Backlight Processing
-    uint8_t live_g = data[0x30];
-    uint8_t live_r = data[0x31];
-    uint8_t live_b = data[0x32];
-
-    bool is_automated_mode = (ambient_mode_switch_ != nullptr && ambient_mode_switch_->state);
-
     if (!initial_sync_done_) {
       // Mirror Display Light on initial startup
-      if (display_light_state_ != nullptr) {
+      if (display_light_state_ != nullptr && !display_initialized_) {
         float target_br = clock_level / 7.0f;
         if (clock_level == 0) target_br = 0.05f;
 
         display_power_state_ = true;
-        display_light_state_->current_values.set_state(is_automated_mode ? false : true);
+        display_light_state_->current_values.set_state(true);
         display_light_state_->current_values.set_brightness(target_br);
         display_light_state_->remote_values = display_light_state_->current_values;
         display_light_state_->publish_state();
@@ -1701,78 +1839,12 @@ void NixPlus::process_binary_frame(const uint8_t *data, size_t len) {
         display_initialized_ = true;
       }
 
-      // Mirror Backlight Light on initial startup
-      if (backlight_light_state_ != nullptr) {
-        uint8_t max_val = std::max({live_r, live_g, live_b});
-        bool want_on = (max_val > 0);
-
-        if (!want_on) {
-          manual_backlight_active_ = false;
-          backlight_power_state_ = false;
-          backlight_initialized_ = true;
-          confirmed_backlight_power_ = false;
-          last_g_val_ = 0;
-          last_r_val_ = 0;
-          last_b_val_ = 0;
-          last_rgb_valid_ = true;
-          active_backlight_effect_ = -1;
-          last_cycling_brightness_valid_ = false;
-
-          backlight_light_state_->current_values.set_state(false);
-          backlight_light_state_->remote_values = backlight_light_state_->current_values;
-          backlight_light_state_->publish_state();
-        } else {
-          float max_scale = 31.0f;
-          float live_bl_brightness = std::clamp(static_cast<float>(max_val) / max_scale, 0.05f, 1.0f);
-          float r_norm = static_cast<float>(live_r) / max_val;
-          float g_norm = static_cast<float>(live_g) / max_val;
-          float b_norm = static_cast<float>(live_b) / max_val;
-
-          backlight_power_state_ = true;
-          backlight_initialized_ = true;
-          confirmed_backlight_power_ = true;
-          confirmed_r_ = live_r;
-          confirmed_g_ = live_g;
-          confirmed_b_ = live_b;
-          last_g_val_ = live_g;
-          last_r_val_ = live_r;
-          last_b_val_ = live_b;
-          last_rgb_valid_ = true;
-
-          backlight_light_state_->current_values.set_color_mode(light::ColorMode::RGB);
-          backlight_light_state_->current_values.set_red(r_norm);
-          backlight_light_state_->current_values.set_green(g_norm);
-          backlight_light_state_->current_values.set_blue(b_norm);
-          backlight_light_state_->current_values.set_brightness(live_bl_brightness);
-          backlight_light_state_->current_values.set_state(is_automated_mode ? false : true);
-          backlight_light_state_->remote_values = backlight_light_state_->current_values;
-          backlight_light_state_->publish_state();
-
-          if (initial_cycler_mode_ >= 0 && initial_cycler_mode_ <= 5) {
-            active_backlight_effect_ = initial_cycler_mode_;
-            last_cycling_brightness_valid_ = false;
-            if (!is_automated_mode) {
-              static const char *const CYCLER_EFFECTS[6] = {
-                "Colour Cycle - Extremely Slow",
-                "Colour Cycle - Extra Slow",
-                "Colour Cycle - Slow",
-                "Colour Cycle - Medium",
-                "Colour Cycle - Fast",
-                "Colour Cycle - Extra Fast"
-              };
-              auto call = backlight_light_state_->make_call();
-              call.set_effect(CYCLER_EFFECTS[initial_cycler_mode_]);
-              call.set_transition_length(0);
-              call.perform();
-            }
-          } else {
-            active_backlight_effect_ = -1;
-            last_cycling_brightness_valid_ = false;
-          }
+      if (backlight_settings_valid_) {
+        initial_sync_done_ = true;
+        if (ambient_mode_switch_ != nullptr && ambient_mode_switch_->state) {
+          revert_lights();
         }
       }
-
-      initial_sync_done_ = true;
     }
 
   } else if (opcode == 0x01) {
@@ -1843,12 +1915,14 @@ void NixPlus::process_line(const std::string &line) {
   if (line.find("AUTOBRIGHT:1") != std::string::npos ||
       line.find("AUTOBRIGHT:ON") != std::string::npos ||
       (line.find("AUTOBRIGHT") != std::string::npos && line.find("AUTOBRIGHT:0") == std::string::npos)) {
-    ESP_LOGI(TAG, "Clock signaled surrender of manual control via hardware button -> turning Auto Brightness ON");
+    ESP_LOGI(TAG, "Clock signaled surrender of manual control (button/USB) -> turning Auto Brightness ON");
     if (!is_automated_mode()) {
       revert_lights();
     }
     this->set_timeout("sync_after_button_event", 300, [this]() {
+      read_clock_settings();
       read_backlight_settings();
+      request_sensors();
     });
     return;
   }
@@ -2161,9 +2235,6 @@ void NixPlus::loop() {
     if (now - last_sensor_request_ > 15000) {
       request_sensors();
       last_sensor_request_ = now;
-    } else if (now - last_backlight_settings_poll_ > 60000 && (now - last_sensor_request_ > 2000)) {
-      read_backlight_settings();
-      last_backlight_settings_poll_ = now;
     } else if (now - last_info_poll_ > 60000 && (now - last_sensor_request_ > 4000)) {
       send_device_info_request();
       last_info_poll_ = now;

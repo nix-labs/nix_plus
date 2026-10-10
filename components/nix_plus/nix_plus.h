@@ -39,6 +39,10 @@ class NixPlusLight : public light::LightOutput {
 
  protected:
   NixPlus *parent_{nullptr};
+  std::string last_effect_{"None"};
+  float last_r_{-1.0f};
+  float last_g_{-1.0f};
+  float last_b_{-1.0f};
 };
 
 class NixPlusDisplayLight : public light::LightOutput {
@@ -91,6 +95,8 @@ class NixPlus : public Component, public uart::UARTDevice {
   bool is_initial_sync_done() const { return initial_sync_done_; }
   bool is_manual_backlight_active() const { return manual_backlight_active_; }
   bool is_automated_mode() const { return ambient_mode_switch_ != nullptr && ambient_mode_switch_->state; }
+  bool is_in_mode_transition() const { return in_mode_transition_; }
+  bool is_in_rollback() const { return in_rollback_; }
 
   // Actions & Control (Existing clock commands)
   void display_number(float value, uint8_t duration_sec = 5);
@@ -107,6 +113,10 @@ class NixPlus : public Component, public uart::UARTDevice {
   void set_backlight_cycling(uint8_t mode, uint8_t brightness = 255);
   void revert_lights();
   void apply_manual_lights();
+  void send_unified_manual_lights(uint8_t disp_level);
+  void apply_manual_display();
+  void apply_manual_backlight();
+  void clear_backlight_effect_later();
   void schedule_state_confirmation();
   void play_tone(uint16_t frequency_hz, uint16_t duration_ms, uint8_t volume = 7);
   void beep(uint8_t count = 1);
@@ -212,6 +222,9 @@ class NixPlus : public Component, public uart::UARTDevice {
   uint8_t cached_custom_r_{0};
   uint8_t cached_custom_b_{0};
   switch_::Switch *ambient_mode_switch_{nullptr};
+  bool applying_manual_pair_{false};
+  bool in_mode_transition_{false};
+  bool in_rollback_{false};
 
   std::deque<CommandTransaction> tx_queue_;
 

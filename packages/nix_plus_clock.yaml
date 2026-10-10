@@ -44,7 +44,7 @@ nix_plus:
     id: clock_display
     default_transition_length: 0s
     gamma_correct: 1.0
-    restore_mode: RESTORE_AND_OFF
+    restore_mode: RESTORE_DEFAULT_ON
     web_server:
       sorting_group_id: sorting_clock
       sorting_weight: 3
@@ -53,7 +53,7 @@ nix_plus:
     id: rgb_backlight
     default_transition_length: 0s
     gamma_correct: 1.0
-    restore_mode: RESTORE_AND_OFF
+    restore_mode: RESTORE_DEFAULT_ON
     web_server:
       sorting_group_id: sorting_clock
       sorting_weight: 4
@@ -102,13 +102,13 @@ switch:
     on_turn_on:
       then:
         - lambda: |-
-            if (id(nix_clock).is_initial_sync_done()) {
+            if (id(nix_clock).is_initial_sync_done() && !id(nix_clock).is_in_mode_transition()) {
               id(nix_clock).revert_lights();
             }
     on_turn_off:
       then:
         - lambda: |-
-            if (id(nix_clock).is_initial_sync_done()) {
+            if (id(nix_clock).is_initial_sync_done() && !id(nix_clock).is_in_mode_transition()) {
               id(nix_clock).apply_manual_lights();
             }
 
