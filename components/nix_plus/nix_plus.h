@@ -228,6 +228,10 @@ class NixPlus : public Component, public uart::UARTDevice {
 
   std::deque<CommandTransaction> tx_queue_;
 
+  // Daylight Saving Time state tracking for instant transition detection
+  int8_t last_dst_state_{-1};
+  uint32_t last_dst_check_ms_{0};
+
   // Confirmed hardware states (for tracking & rollback if a command fails)
   uint8_t confirmed_display_level_{7};
   bool confirmed_display_power_{true};

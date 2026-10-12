@@ -51,9 +51,13 @@ time:
     update_interval: 15min
     on_time_sync:
       then:
-        - lambda: |-
-            id(nix_clock).sync_time_to_clock();
-            ESP_LOGW("main", "SNTP Synchronized — writing accurate time to clock RTCC.");
+        - if:
+            condition:
+              lambda: "return id(sntp_switch).state;"
+            then:
+              - lambda: |-
+                  id(nix_clock).sync_time_to_clock();
+                  ESP_LOGW("main", "SNTP Synchronized — writing accurate time to clock RTCC.");
 
 interval:
   # Periodic RTCC sync: keep base clock RTCC accurate during normal SNTP operation

@@ -412,6 +412,10 @@ void NixPlus::request_sensors() {
 // Time Synchronization
 void NixPlus::sync_time_to_clock() {
   manual_time_set_ = false;
+  if (sntp_switch_ != nullptr && !sntp_switch_->state) {
+    ESP_LOGI(TAG, "Network time sync is disabled; skipping clock RTCC update.");
+    return;
+  }
   if (time_ != nullptr) {
     ESPTime now = time_->now();
     if (now.year >= 2020 && now.fields_in_range(false, false)) {
@@ -437,7 +441,7 @@ void NixPlus::sync_time_to_clock() {
       return;
     }
   }
-  trigger_time_sync();
+  ESP_LOGD(TAG, "Network time not yet valid (year < 2020); skipping sync.");
 }
 
 void NixPlus::sync_time_to_clock(ESPTime now) {
@@ -1582,6 +1586,19 @@ void NixPlus::process_binary_frame(const uint8_t *data, size_t len) {
 
     if (!tx_queue_.empty() && tx_queue_.front().opcode == err_cmd) {
       auto &tx = tx_queue_.front();
+
+      // If command is unsupported (0x01/0x02) or clock is busy in button menu (0x06), drop gracefully without retrying
+      if (err_code == 0x01 || err_code == 0x02 || err_code == 0x06) {
+        ESP_LOGW(TAG, "Command 0x%02X not supported or clock busy (code 0x%02X); dropping gracefully without retry",
+                 err_cmd, err_code);
+        rollback_unconfirmed_state(tx);
+        tx_queue_.pop_front();
+        if (!tx_queue_.empty()) {
+          process_tx_queue();
+        }
+        return;
+      }
+
       if (tx.attempts < tx.max_attempts) {
         tx.attempts++;
         tx.last_send_ms = millis();
@@ -1699,8 +1716,8 @@ void NixPlus::process_binary_frame(const uint8_t *data, size_t len) {
     ESP_LOGI(TAG, "Clock settings cached: disp=0x%02X, misc=0x%02X, thresh=%u, night=%u-%u, misc3=0x%02X, misc4=0x%02X",
              data[9], data[10], data[11], data[12], data[13], data[14], data[15]);
 
-    // If internet time is already valid, immediately sync to clock using these verified settings
-    if (time_ != nullptr) {
+    // If internet time is already valid and SNTP sync is enabled, sync to clock using these verified settings
+    if (time_ != nullptr && (sntp_switch_ == nullptr || sntp_switch_->state)) {
       ESPTime now = time_->now();
       if (now.year >= 2020 && now.fields_in_range(false, false)) {
         sync_time_to_clock();
@@ -2207,6 +2224,21 @@ void NixPlus::loop() {
     if (current_ip != last_published_ip_) {
       last_published_ip_ = current_ip;
       ip_address_sensor_->publish_state(current_ip);
+    }
+  }
+
+  // Monitor for Daylight Saving Time shift every 1 second
+  if (time_ != nullptr && (now - last_dst_check_ms_ >= 1000)) {
+    last_dst_check_ms_ = now;
+    ESPTime current_time = time_->now();
+    if (current_time.year >= 2020 && current_time.fields_in_range(false, false)) {
+      if (last_dst_state_ == -1) {
+        last_dst_state_ = current_time.is_dst ? 1 : 0;
+      } else if (last_dst_state_ != (current_time.is_dst ? 1 : 0)) {
+        last_dst_state_ = current_time.is_dst ? 1 : 0;
+        ESP_LOGI(TAG, "Daylight Saving Time transition detected (is_dst=%d)! Syncing base clock RTCC immediately...", last_dst_state_);
+        sync_time_to_clock();
+      }
     }
   }
 
