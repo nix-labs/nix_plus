@@ -154,7 +154,7 @@ button:
 
   # Display Override & Screen Actions
   - platform: template
-    name: "Display Number"
+    name: "Show Number"
     id: display_number_button
     web_server:
       sorting_group_id: sorting_override

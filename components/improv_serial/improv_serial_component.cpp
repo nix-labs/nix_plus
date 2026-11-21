@@ -20,7 +20,7 @@ void ImprovSerialComponent::setup() {
   } else if (wifi::global_wifi_component != nullptr && wifi::global_wifi_component->has_sta() &&
              !wifi::global_wifi_component->get_sta().get_ssid().empty()) {
     this->state_ = improv::STATE_PROVISIONING;
-    this->set_timeout("wifi-connect-timeout", 30000, [this]() { this->on_wifi_connect_timeout_(); });
+    this->set_timeout("wifi-connect-timeout", WIFI_CONNECT_TIMEOUT_MS, [this]() { this->on_wifi_connect_timeout_(); });
   } else {
     this->state_ = improv::STATE_AUTHORIZED;
     if (wifi::global_wifi_component != nullptr && !wifi::global_wifi_component->is_disabled()) {
@@ -42,6 +42,18 @@ void ImprovSerialComponent::loop() {
 
   if (this->state_ == improv::STATE_PROVISIONING) {
     if (wifi::global_wifi_component != nullptr && wifi::global_wifi_component->is_connected()) {
+      if (this->provisioning_new_sta_) {
+        char ssid_buf[wifi::SSID_BUFFER_SIZE];
+        const char *connected_ssid = wifi::global_wifi_component->wifi_ssid_to(ssid_buf);
+        if (strcmp(connected_ssid, this->connecting_sta_.get_ssid().c_str()) != 0) {
+          return;  // Still connected to previous network while switching
+        }
+        wifi::global_wifi_component->save_wifi_sta(this->connecting_sta_.get_ssid().c_str(),
+                                                   this->connecting_sta_.get_password().c_str());
+        this->provisioning_new_sta_ = false;
+        this->previous_sta_ = {};
+        this->has_previous_sta_ = false;
+      }
       this->connecting_sta_ = {};
       this->cancel_timeout("wifi-connect-timeout");
       this->set_state_(improv::STATE_PROVISIONED);
@@ -58,7 +70,8 @@ void ImprovSerialComponent::loop() {
     } else if (!wifi::global_wifi_component->is_disabled() && this->state_ == improv::STATE_PROVISIONED) {
       if (wifi::global_wifi_component->has_sta() && !wifi::global_wifi_component->get_sta().get_ssid().empty()) {
         this->set_state_(improv::STATE_PROVISIONING);
-        this->set_timeout("wifi-connect-timeout", 30000, [this]() { this->on_wifi_connect_timeout_(); });
+        this->set_timeout("wifi-connect-timeout", WIFI_CONNECT_TIMEOUT_MS,
+                          [this]() { this->on_wifi_connect_timeout_(); });
       } else {
         this->set_state_(improv::STATE_AUTHORIZED);
       }
@@ -188,11 +201,15 @@ bool ImprovSerialComponent::parse_improv_payload_(improv::ImprovCommand &command
             break;
           }
         }
+        // Snapshot any prior valid STA before attempting unverified credentials (saved only after connect succeeds)
+        if (!this->provisioning_new_sta_ && wifi::global_wifi_component->has_sta() &&
+            !wifi::global_wifi_component->get_sta().get_ssid().empty()) {
+          this->previous_sta_ = wifi::global_wifi_component->get_sta();
+          this->has_previous_sta_ = true;
+        }
       }
 
-      // Save credentials immediately to flash so they persist across reboots
-      wifi::global_wifi_component->save_wifi_sta(command.ssid.c_str(), command.password.c_str());
-
+      this->provisioning_new_sta_ = true;
       wifi::global_wifi_component->set_sta(this->connecting_sta_);
       wifi::global_wifi_component->start_connecting(this->connecting_sta_);
 
@@ -200,7 +217,8 @@ bool ImprovSerialComponent::parse_improv_payload_(improv::ImprovCommand &command
       ESP_LOGD(TAG, "Received settings: SSID=%s, password=" LOG_SECRET("%s"), command.ssid.c_str(),
                command.password.c_str());
 
-      this->set_timeout("wifi-connect-timeout", 45000, [this]() { this->on_wifi_connect_timeout_(); });
+      this->set_timeout("wifi-connect-timeout", WIFI_CONNECT_TIMEOUT_MS,
+                        [this]() { this->on_wifi_connect_timeout_(); });
       return true;
     }
     case improv::GET_CURRENT_STATE:
@@ -289,11 +307,29 @@ void ImprovSerialComponent::send_response_(std::vector<uint8_t> &response) {
 }
 
 void ImprovSerialComponent::on_wifi_connect_timeout_() {
+  if (this->provisioning_new_sta_) {
+    this->provisioning_new_sta_ = false;
+    if (wifi::global_wifi_component != nullptr) {
+      if (this->has_previous_sta_) {
+        ESP_LOGW(TAG, "Provisioning failed; restoring previous Wi-Fi network '%s'",
+                 this->previous_sta_.get_ssid().c_str());
+        wifi::global_wifi_component->set_sta(this->previous_sta_);
+        wifi::global_wifi_component->start_connecting(this->previous_sta_);
+      } else {
+        wifi::global_wifi_component->clear_sta();
+      }
+    }
+    this->previous_sta_ = {};
+  }
+
+  bool restored_previous = this->has_previous_sta_;
+  this->has_previous_sta_ = false;
+
   this->set_error_(improv::ERROR_UNABLE_TO_CONNECT);
   this->set_state_(improv::STATE_AUTHORIZED);
   ESP_LOGW(TAG, "Timed out while connecting to Wi-Fi network");
   this->connecting_sta_ = {};
-  if (wifi::global_wifi_component != nullptr && !wifi::global_wifi_component->is_disabled()) {
+  if (!restored_previous && wifi::global_wifi_component != nullptr && !wifi::global_wifi_component->is_disabled()) {
     wifi::global_wifi_component->start_scanning();
   }
 }

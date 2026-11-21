@@ -9,9 +9,7 @@ esphome:
       then:
         - lambda: |-
             if (id(time_zone_rule).state.empty()) {
-              auto call = id(time_zone_rule).make_call();
-              call.set_value("${time_zone}");
-              call.perform();
+              id(time_zone_rule).publish_state("${time_zone}");
               ESP_LOGI("main", "Initialized Time Zone to default: %s", id(time_zone_rule).state.c_str());
             }
 
@@ -33,10 +31,8 @@ esphome:
             condition:
               lambda: "return !id(timezone_configured);"
             then:
+              - delay: 2s
               - button.press: detect_timezone
-              - globals.set:
-                  id: timezone_configured
-                  value: "true"
 
 time:
   # Internet Time Sync (SNTP)
@@ -98,6 +94,12 @@ text:
     web_server:
       sorting_group_id: sorting_time
       sorting_weight: 1
+    set_action:
+      then:
+        - lambda: |-
+            if (esphome::nix_plus::NixPlus::is_valid_posix_tz(x)) {
+              id(timezone_configured) = true;
+            }
     on_value:
       then:
         - lambda: |-
@@ -113,9 +115,6 @@ text:
             } else {
               ESP_LOGI("main", "Timezone restored at boot — skipping time sync (SNTP not yet valid)");
             }
-        - globals.set:
-            id: timezone_configured
-            value: "true"
 
 button:
   # Detect Timezone via IP Geolocation
@@ -129,26 +128,90 @@ button:
       then:
         - logger.log: "Stage 1: Detecting IANA Timezone..."
         - http_request.get:
-            url: "http://ipwho.is/"
+            url: "https://ipwho.is/?fields=success,timezone"
             request_headers:
               User-Agent: "ESPHome/NIXPlus"
             capture_response: true
+            max_response_buffer_size: 512B
             on_response:
               then:
                 - lambda: |-
-                    if (body.empty()) {
-                      ESP_LOGE("main", "Timezone Stage 1 failed. Check internet connection.");
+                    if (response->status_code != 200 || body.empty()) {
+                      ESP_LOGW("main", "Timezone Stage 1 (ipwho.is) failed (HTTP %d); trying fallback.", response->status_code);
+                      id(nix_clock).defer("tz_fallback", []() { id(detect_timezone_fallback).press(); });
                       return;
                     }
-                    json::parse_json(body, [](JsonObject root) -> bool {
+                    bool ok = json::parse_json(body, [](JsonObject root) -> bool {
+                      if (root["success"].is<bool>() && !root["success"].as<bool>()) {
+                        return false;
+                      }
                       JsonObject tz = root["timezone"];
                       if (tz["id"].is<const char*>()) {
-                        id(detected_iana) = tz["id"].as<std::string>();
-                        id(fetch_posix_rule).press();
-                        return true;
+                        std::string iana = tz["id"].as<std::string>();
+                        if (!iana.empty()) {
+                          id(detected_iana) = iana;
+                          // Defer Stage 2 so Stage 1's TLS session & JSON heap are freed first
+                          id(nix_clock).defer("tz_stage2", []() { id(fetch_posix_rule).press(); });
+                          return true;
+                        }
                       }
                       return false;
                     });
+                    if (!ok) {
+                      ESP_LOGW("main", "Timezone Stage 1 (ipwho.is) parse failed; trying fallback.");
+                      id(nix_clock).defer("tz_fallback", []() { id(detect_timezone_fallback).press(); });
+                    }
+            on_error:
+              then:
+                - logger.log:
+                    level: WARN
+                    format: "Timezone Stage 1 (ipwho.is) request error; trying fallback."
+                - lambda: |-
+                    id(nix_clock).defer("tz_fallback", []() { id(detect_timezone_fallback).press(); });
+
+  # Stage 1 Fallback: ip-api.com if ipwho.is fails or rate-limits
+  - platform: template
+    name: "Detect Timezone Fallback"
+    id: detect_timezone_fallback
+    internal: true
+    on_press:
+      then:
+        - logger.log: "Stage 1 Fallback: Detecting IANA Timezone via ip-api.com..."
+        - http_request.get:
+            url: "http://ip-api.com/json/?fields=status,timezone"
+            request_headers:
+              User-Agent: "ESPHome/NIXPlus"
+            capture_response: true
+            max_response_buffer_size: 512B
+            on_response:
+              then:
+                - lambda: |-
+                    if (response->status_code != 200 || body.empty()) {
+                      ESP_LOGE("main", "Timezone Stage 1 fallback failed (HTTP %d). Check internet connection.", response->status_code);
+                      return;
+                    }
+                    bool ok = json::parse_json(body, [](JsonObject root) -> bool {
+                      if (!root["status"].is<const char*>() || root["status"].as<std::string>() != "success") {
+                        return false;
+                      }
+                      if (root["timezone"].is<const char*>()) {
+                        std::string iana = root["timezone"].as<std::string>();
+                        if (!iana.empty()) {
+                          id(detected_iana) = iana;
+                          id(nix_clock).defer("tz_stage2", []() { id(fetch_posix_rule).press(); });
+                          return true;
+                        }
+                      }
+                      return false;
+                    });
+                    if (!ok) {
+                      ESP_LOGE("main", "Timezone Stage 1 fallback returned invalid response.");
+                    }
+            on_error:
+              then:
+                - logger.log:
+                    level: ERROR
+                    format: "Timezone Stage 1 fallback failed. Check internet connection."
 
   # Stage 2: Lookup POSIX Rule from our static database
   - platform: template
@@ -167,33 +230,38 @@ button:
             request_headers:
               User-Agent: "ESPHome/NIXPlus"
             capture_response: true
+            max_response_buffer_size: 8kB
             on_response:
               then:
                 - lambda: |-
+                    if (response->status_code != 200 || body.empty()) {
+                      ESP_LOGE("main", "Timezone Stage 2 failed (HTTP %d). Keeping existing timezone.", response->status_code);
+                      return;
+                    }
                     bool found = false;
                     std::string iana = id(detected_iana);
-                    if (!body.empty()) {
-                      json::parse_json(body, [&found, iana](JsonObject root) -> bool {
-                        size_t pos = iana.find('/');
-                        std::string city = (pos != std::string::npos && pos + 1 < iana.size()) ? iana.substr(pos + 1) : iana;
-                        if (!city.empty() && root[city].is<const char*>()) {
-                          std::string posix = root[city].as<std::string>();
-                          auto call = id(time_zone_rule).make_call();
-                          call.set_value(posix);
-                          call.perform();
-                          ESP_LOGI("main", "Success! Applied POSIX rule for %s: %s", iana.c_str(), posix.c_str());
-                          found = true;
-                          return true;
-                        }
-                        return false;
-                      });
-                    }
+                    json::parse_json(body, [&found, iana](JsonObject root) -> bool {
+                      size_t pos = iana.find('/');
+                      std::string city = (pos != std::string::npos && pos + 1 < iana.size()) ? iana.substr(pos + 1) : iana;
+                      if (!city.empty() && root[city].is<const char*>()) {
+                        std::string posix = root[city].as<std::string>();
+                        auto call = id(time_zone_rule).make_call();
+                        call.set_value(posix);
+                        call.perform();
+                        ESP_LOGI("main", "Success! Applied POSIX rule for %s: %s", iana.c_str(), posix.c_str());
+                        found = true;
+                        return true;
+                      }
+                      return false;
+                    });
                     if (!found) {
-                      ESP_LOGW("main", "City '%s' not in DB. Fallback: ${time_zone}", iana.c_str());
-                      auto call = id(time_zone_rule).make_call();
-                      call.set_value("${time_zone}");
-                      call.perform();
+                      ESP_LOGW("main", "City '%s' not found in POSIX DB. Keeping existing timezone.", iana.c_str());
                     }
+            on_error:
+              then:
+                - logger.log:
+                    level: ERROR
+                    format: "Timezone Stage 2 request failed. Keeping existing timezone."
 
   - platform: template
     name: "Force RTC Sync Now"

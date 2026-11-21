@@ -96,7 +96,8 @@ jobs:
 
           # 3. Bake the version into nix_plus.yaml for end-user import
           cp nix_plus.yaml public/nix_plus.yaml
-          sed -i 's/v\${version}/v'"$V_NUM"'/g' public/nix_plus.yaml
+          sed -i 's/version: "0"/version: "'"$V_NUM"'"/' public/nix_plus.yaml
+          grep -q 'version: "'"$V_NUM"'"' public/nix_plus.yaml
 
           # 4. Calculate MD5 for OTA binary
           MD5_OTA=$(md5sum "public/firmware/nix_plus_${V_NUM}_ota.bin" | awk '{ print $1 }')

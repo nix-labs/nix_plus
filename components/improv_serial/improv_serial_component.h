@@ -74,9 +74,14 @@ class ImprovSerialComponent : public Component, public improv_base::ImprovBase, 
       '\n',
   };
 
+  static constexpr uint32_t WIFI_CONNECT_TIMEOUT_MS = 30000;
+
   std::vector<uint8_t> rx_buffer_;
   uint32_t last_read_byte_{0};
   wifi::WiFiAP connecting_sta_;
+  wifi::WiFiAP previous_sta_;
+  bool has_previous_sta_{false};
+  bool provisioning_new_sta_{false};
   improv::State state_{improv::STATE_AUTHORIZED};
 };
 

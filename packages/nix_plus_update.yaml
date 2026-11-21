@@ -1,8 +1,18 @@
 # NIX+ Update Package
 # Provides NIX labs managed OTA updates for modules running factory firmware
 
+globals:
+  - id: ota_check_done
+    type: bool
+    restore_value: false
+    initial_value: "false"
+
 esphome:
   on_boot:
+    - priority: -100
+      then:
+        - lambda: |-
+            id(firmware_update)->add_on_state_callback([]() { id(ota_check_done) = true; });
     - priority: 100
       then:
         - wait_until:
@@ -33,15 +43,45 @@ button:
       sorting_weight: 3
     on_press:
       then:
-        - logger.log: "Initiating firmware update process..."
-        - update.check: firmware_update
-        - delay: 3s # Allow time for manifest fetch and parsing
         - if:
             condition:
-              update.is_available: firmware_update
+              wifi.connected:
             then:
-              - logger.log: "New version found! Starting Over-The-Air (OTA) update..."
-              - update.perform: firmware_update
+              - logger.log: "Initiating firmware update check..."
+              - lambda: |-
+                  id(ota_check_done) = false;
+                  id(firmware_update)->status_clear_error();
+              - update.check: firmware_update
+              - wait_until:
+                  condition:
+                    lambda: "return id(ota_check_done) || id(firmware_update)->status_has_error();"
+                  timeout: 15s
+              - if:
+                  condition:
+                    lambda: "return id(firmware_update)->status_has_error();"
+                  then:
+                    - logger.log:
+                        level: ERROR
+                        format: "Firmware update check failed. Please check internet connection."
+                  else:
+                    - if:
+                        condition:
+                          lambda: "return !id(ota_check_done);"
+                        then:
+                          - logger.log:
+                              level: WARN
+                              format: "Firmware update check timed out after 15s."
+                        else:
+                          - if:
+                              condition:
+                                update.is_available: firmware_update
+                              then:
+                                - logger.log: "New version found! Starting Over-The-Air (OTA) update..."
+                                - update.perform: firmware_update
+                              else:
+                                - logger.log: "No update available. Your module is currently up to date."
             else:
-              - logger.log: "No update available. Your module is currently up to date."
+              - logger.log:
+                  level: WARN
+                  format: "Cannot check for firmware updates while Wi-Fi is disconnected."
 

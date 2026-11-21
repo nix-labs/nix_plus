@@ -56,6 +56,7 @@ class NixPlusDisplayLight : public light::LightOutput {
 };
 
 class NixPlus : public Component, public uart::UARTDevice {
+  friend class NixPlusLight;
  public:
   NixPlus() = default;
 
@@ -97,6 +98,7 @@ class NixPlus : public Component, public uart::UARTDevice {
   bool is_automated_mode() const { return ambient_mode_switch_ != nullptr && ambient_mode_switch_->state; }
   bool is_in_mode_transition() const { return in_mode_transition_; }
   bool is_in_rollback() const { return in_rollback_; }
+  bool is_suppressing_light_write() const { return in_rollback_ || suppress_light_write_; }
 
   // Actions & Control (Existing clock commands)
   void display_number(float value, uint8_t duration_sec = 5);
@@ -117,13 +119,12 @@ class NixPlus : public Component, public uart::UARTDevice {
   void apply_manual_display();
   void apply_manual_backlight();
   void clear_backlight_effect_later();
-  void schedule_state_confirmation();
   void play_tone(uint16_t frequency_hz, uint16_t duration_ms, uint8_t volume = 7);
   void beep(uint8_t count = 1);
   void sync_time_to_clock();
-  void sync_time_to_clock(ESPTime time);
   void trigger_time_sync();
   void set_timezone(const std::string &tz_str);
+  static bool is_valid_posix_tz(const std::string &tz_str);
 
   // Timer Controls (Opcode 0x20)
   void start_timer(uint32_t seconds);
@@ -139,12 +140,27 @@ class NixPlus : public Component, public uart::UARTDevice {
   void request_sensors();          // Opcode 0x11
   void request_module_status();    // Opcode 0xE0
   void enable_clock_module();      // Opcode 0xE1
-  void send_packet(const uint8_t *data, size_t len = 64);
 
  protected:
+  void send_packet(const uint8_t *data, size_t len = 64);
   static uint16_t crc16_ccitt(const uint8_t *data, size_t len);
+  static bool is_read_opcode_(uint8_t opcode);
+  static int8_t effect_name_to_cycle_mode_(const std::string &effect);
+  static void scale_rgb_to_5bit_(float r, float g, float b, float brightness,
+                                 uint8_t &out_r, uint8_t &out_g, uint8_t &out_b);
+  bool exit_auto_mode_if_needed_();
+  void build_light_frame_(uint8_t *frame, bool bl_on, int8_t cycle_mode,
+                          uint8_t r, uint8_t g, uint8_t b, uint8_t brightness,
+                          int8_t disp_level);
+  void wake_display_in_frame_(uint8_t *frame);
+  void sync_display_light_ui_(bool power, uint8_t level, bool update_power, bool update_brightness);
+  void maybe_complete_initial_sync_();
+  bool has_pending_opcode_(uint8_t opcode) const;
   void process_line(const std::string &line);
   void process_binary_frame(const uint8_t *data, size_t len);
+
+  static constexpr size_t MAX_TX_QUEUE_SIZE = 16;
+  static constexpr uint32_t TX_PACING_GAP_MS = 25;
 
   uint8_t user_configured_digits_{0}; // 0 = Auto-detect
   uint8_t num_digits_{4};            // Default fallback
@@ -160,7 +176,8 @@ class NixPlus : public Component, public uart::UARTDevice {
   light::LightState *backlight_light_state_{nullptr};
 
   bool display_power_state_{true};
-  bool display_initialized_{false};
+  bool display_power_initialized_{false};
+  bool display_brightness_initialized_{false};
   uint8_t display_brightness_level_{7};
   bool last_brightness_valid_{false};
   uint8_t last_brightness_level_{255};
@@ -179,8 +196,6 @@ class NixPlus : public Component, public uart::UARTDevice {
   switch_::Switch *sntp_switch_{nullptr};
   text::Text *time_zone_text_{nullptr};
   button::Button *detect_timezone_button_{nullptr};
-  bool manual_time_set_{false};
-  ESPTime manual_time_{};
   bool clock_settings_valid_{false};
   uint8_t clock_settings_[7]{0b00000001, 0b00010011, 0x00, 0x00, 0x00, 0x00, 0x00};
   uint32_t last_settings_request_{0};
@@ -218,15 +233,19 @@ class NixPlus : public Component, public uart::UARTDevice {
   uint8_t cached_clock_brightness_{0};
   bool clock_brightness_valid_{false};
   uint8_t cached_misc_opt2_{0};
+  uint8_t cached_misc_opt4_{0};
+  bool misc_opt4_valid_{false};
   uint8_t cached_custom_g_{0};
   uint8_t cached_custom_r_{0};
   uint8_t cached_custom_b_{0};
   switch_::Switch *ambient_mode_switch_{nullptr};
-  bool applying_manual_pair_{false};
   bool in_mode_transition_{false};
   bool in_rollback_{false};
+  bool suppress_light_write_{false};
 
   std::deque<CommandTransaction> tx_queue_;
+  uint32_t last_tx_complete_ms_{0};
+  bool has_completed_tx_{false};
 
   // Daylight Saving Time state tracking for instant transition detection
   int8_t last_dst_state_{-1};
