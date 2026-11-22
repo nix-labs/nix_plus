@@ -84,11 +84,11 @@ jobs:
               cp "$BUILD_PATH/boot_app0.bin" public/firmware/boot_app0.bin
               OTA_DATA="public/firmware/boot_app0.bin"
             fi
-            esptool.py --chip esp32 merge_bin \
+            esptool.py --chip esp32c3 merge_bin \
               -o "public/firmware/nix_plus_${V_NUM}_factory.bin" \
               --flash_mode dio \
               --flash_size 4MB \
-              0x1000 public/firmware/bootloader.bin \
+              0x0 public/firmware/bootloader.bin \
               0x8000 public/firmware/partitions.bin \
               0xe000 "$OTA_DATA" \
               0x10000 "public/firmware/nix_plus_${V_NUM}_ota.bin"
@@ -110,7 +110,7 @@ jobs:
             "home_assistant_domain": "esphome",
             "builds": [
               {
-                "chipFamily": "ESP32",
+                "chipFamily": "ESP32-C3",
                 "parts": [
                   { "path": "nix_plus_${V_NUM}_factory.bin", "offset": 0 }
                 ],
