@@ -1811,13 +1811,15 @@ void NixPlus::process_binary_frame(const uint8_t *data, size_t len) {
 
   } else if (opcode == 0x11) {
     uint16_t raw_als = (static_cast<uint16_t>(data[8]) << 8) | data[9];
-    // PIC32 currently clamps temperature >= 0 °C and encodes unsigned millidegrees C (0..65.535 °C)
+    // PIC32 encodes temperature magnitude in unsigned millidegrees C (0..65.500 °C)
+    // with sign bit in byte 0x3B bit 0 (MEAS_FLAGS_TEMP_NEGATIVE = 0x01)
     uint16_t raw_temp = (static_cast<uint16_t>(data[20]) << 8) | data[21];
+    bool temp_negative = (data[0x3B] & 0x01) != 0;
     uint8_t is_day = data[0x29]; // byte 41: ALS_isDay
 
     // raw_als is in mV (0 to ~2400mV max). Scale to 0-100%
     float als_pct = std::min(100.0f, std::max(0.0f, (raw_als / 2400.0f) * 100.0f));
-    float temp_c = raw_temp / 1000.0f;
+    float temp_c = (temp_negative ? -static_cast<float>(raw_temp) : static_cast<float>(raw_temp)) / 1000.0f;
 
     if (ambient_light_sensor_ != nullptr) {
       ambient_light_sensor_->publish_state(als_pct);
