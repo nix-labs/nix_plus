@@ -138,7 +138,7 @@ button:
                 - lambda: |-
                     if (response->status_code != 200 || body.empty()) {
                       ESP_LOGW("main", "Timezone Stage 1 (ipwho.is) failed (HTTP %d); trying fallback.", response->status_code);
-                      id(nix_clock).defer("tz_fallback", []() { id(detect_timezone_fallback).press(); });
+                      App.scheduler.set_timeout(id(nix_clock), "tz_fallback", 0, []() { id(detect_timezone_fallback).press(); });
                       return;
                     }
                     bool ok = json::parse_json(body, [](JsonObject root) -> bool {
@@ -151,7 +151,7 @@ button:
                         if (!iana.empty()) {
                           id(detected_iana) = iana;
                           // Defer Stage 2 so Stage 1's TLS session & JSON heap are freed first
-                          id(nix_clock).defer("tz_stage2", []() { id(fetch_posix_rule).press(); });
+                          App.scheduler.set_timeout(id(nix_clock), "tz_stage2", 0, []() { id(fetch_posix_rule).press(); });
                           return true;
                         }
                       }
@@ -159,7 +159,7 @@ button:
                     });
                     if (!ok) {
                       ESP_LOGW("main", "Timezone Stage 1 (ipwho.is) parse failed; trying fallback.");
-                      id(nix_clock).defer("tz_fallback", []() { id(detect_timezone_fallback).press(); });
+                      App.scheduler.set_timeout(id(nix_clock), "tz_fallback", 0, []() { id(detect_timezone_fallback).press(); });
                     }
             on_error:
               then:
@@ -167,7 +167,7 @@ button:
                     level: WARN
                     format: "Timezone Stage 1 (ipwho.is) request error; trying fallback."
                 - lambda: |-
-                    id(nix_clock).defer("tz_fallback", []() { id(detect_timezone_fallback).press(); });
+                    App.scheduler.set_timeout(id(nix_clock), "tz_fallback", 0, []() { id(detect_timezone_fallback).press(); });
 
   # Stage 1 Fallback: ip-api.com if ipwho.is fails or rate-limits
   - platform: template
@@ -198,7 +198,7 @@ button:
                         std::string iana = root["timezone"].as<std::string>();
                         if (!iana.empty()) {
                           id(detected_iana) = iana;
-                          id(nix_clock).defer("tz_stage2", []() { id(fetch_posix_rule).press(); });
+                          App.scheduler.set_timeout(id(nix_clock), "tz_stage2", 0, []() { id(fetch_posix_rule).press(); });
                           return true;
                         }
                       }

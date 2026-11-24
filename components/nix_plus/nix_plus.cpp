@@ -168,7 +168,6 @@ void NixPlus::set_display_light_state(light::LightState *s) {
   display_light_state_ = s;
   if (s != nullptr) {
     s->set_default_transition_length(0);
-    s->set_gamma_correct(1.0f);
   }
 }
 
@@ -176,7 +175,6 @@ void NixPlus::set_backlight_light_state(light::LightState *s) {
   backlight_light_state_ = s;
   if (s != nullptr) {
     s->set_default_transition_length(0);
-    s->set_gamma_correct(1.0f);
   }
 }
 

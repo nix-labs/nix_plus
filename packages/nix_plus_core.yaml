@@ -18,10 +18,6 @@ globals:
     type: int
     initial_value: "10"
 
-esphome:
-  platformio_options:
-    board_build.flash_mode: dio
-
 # ESP32-C3 platform configuration using esp-idf framework.
 esp32:
   board: esp32-c3-devkitm-1
