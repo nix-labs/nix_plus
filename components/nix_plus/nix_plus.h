@@ -15,6 +15,8 @@
 #include <vector>
 #include <string>
 #include <deque>
+#include "esp_ota_ops.h"
+#include "esp_rom_crc.h"
 
 namespace esphome {
 namespace nix_plus {
@@ -258,6 +260,24 @@ class NixPlus : public Component, public uart::UARTDevice {
   uint8_t confirmed_g_{0};
   uint8_t confirmed_b_{0};
   bool confirmed_backlight_power_{false};
+
+  // UART OTA state
+  static constexpr uint16_t UART_OTA_CHUNK_SIZE = 240;
+  static constexpr uint32_t UART_OTA_TIMEOUT_MS = 15000;
+  bool in_ota_mode_{false};
+  esp_ota_handle_t ota_handle_{0};
+  const esp_partition_t *ota_partition_{nullptr};
+  uint32_t ota_total_size_{0};
+  uint32_t ota_received_bytes_{0};
+  uint32_t ota_expected_crc32_{0};
+  uint32_t ota_running_crc32_{0};
+  uint16_t ota_expected_seq_{0};
+  uint32_t ota_last_rx_ms_{0};
+  std::vector<uint8_t> ota_rx_buf_;
+
+  void handle_uart_ota_begin(const std::string &args);
+  void handle_uart_ota_byte(uint8_t b);
+  void abort_uart_ota(const char *reason);
 };
 
 }  // namespace nix_plus

@@ -102,6 +102,7 @@ uart:
     tx_pin: GPIO0
     rx_pin: GPIO1
     baud_rate: 115200
+    rx_buffer_size: 2048
 
 button:
   - platform: restart

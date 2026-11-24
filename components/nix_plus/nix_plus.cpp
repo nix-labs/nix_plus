@@ -2103,11 +2103,211 @@ void NixPlus::process_line(const std::string &line) {
     std::string resp = std::string("CREDS:") + (has_creds ? "1" : "0") + "\r\n";
     this->write_str(resp.c_str());
     ESP_LOGI(TAG, "Replied to HASCREDS?: %s", resp.c_str());
+
+  } else if (line.find("UART_OTA_BEGIN:") != std::string::npos) {
+    size_t idx = line.find("UART_OTA_BEGIN:");
+    handle_uart_ota_begin(line.substr(idx + 15));
   }
+}
+
+void NixPlus::handle_uart_ota_begin(const std::string &args) {
+  if (in_ota_mode_) {
+    abort_uart_ota("RESTARTED");
+  }
+
+  unsigned long size_ul = 0;
+  unsigned long crc_ul = 0;
+  if (std::sscanf(args.c_str(), "%lu:%lu", &size_ul, &crc_ul) != 2 || size_ul == 0) {
+    ESP_LOGW(TAG, "UART OTA invalid BEGIN args: '%s'", args.c_str());
+    this->write_str("OTA_ERR:ARGS\r\n");
+    return;
+  }
+
+  const esp_partition_t *part = esp_ota_get_next_update_partition(nullptr);
+  if (part == nullptr) {
+    ESP_LOGE(TAG, "UART OTA no update partition found");
+    this->write_str("OTA_ERR:PART\r\n");
+    return;
+  }
+  if (size_ul > part->size) {
+    ESP_LOGE(TAG, "UART OTA size %lu exceeds partition size %lu", size_ul, (unsigned long)part->size);
+    this->write_str("OTA_ERR:SIZE\r\n");
+    return;
+  }
+
+  esp_err_t err = esp_ota_begin(part, OTA_WITH_SEQUENTIAL_WRITES, &ota_handle_);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "esp_ota_begin failed: %s", esp_err_to_name(err));
+    this->write_str("OTA_ERR:BEGIN\r\n");
+    return;
+  }
+
+  ota_partition_ = part;
+  ota_total_size_ = static_cast<uint32_t>(size_ul);
+  ota_expected_crc32_ = static_cast<uint32_t>(crc_ul);
+  ota_received_bytes_ = 0;
+  ota_running_crc32_ = 0;
+  ota_expected_seq_ = 0;
+  ota_last_rx_ms_ = millis();
+  ota_rx_buf_.clear();
+  ota_rx_buf_.reserve(UART_OTA_CHUNK_SIZE + 16);
+  in_ota_mode_ = true;
+
+  ESP_LOGI(TAG, "UART OTA started: size=%lu crc32=0x%08lx part=%s",
+           size_ul, crc_ul, part->label);
+  char resp[32];
+  std::snprintf(resp, sizeof(resp), "OTA_READY:%u\r\n", UART_OTA_CHUNK_SIZE);
+  this->write_str(resp);
+}
+
+void NixPlus::abort_uart_ota(const char *reason) {
+  ESP_LOGW(TAG, "UART OTA aborted: %s", reason);
+  if (ota_handle_ != 0) {
+    esp_ota_abort(ota_handle_);
+    ota_handle_ = 0;
+  }
+  in_ota_mode_ = false;
+  ota_partition_ = nullptr;
+  ota_rx_buf_.clear();
+  char resp[48];
+  std::snprintf(resp, sizeof(resp), "OTA_ERR:%s\r\n", reason);
+  this->write_str(resp);
+}
+
+void NixPlus::handle_uart_ota_byte(uint8_t b) {
+  ota_last_rx_ms_ = millis();
+
+  if (ota_rx_buf_.empty()) {
+    if (b == 0xAA) {
+      ota_rx_buf_.push_back(b);
+    }
+    return;
+  }
+
+  if (ota_rx_buf_.size() == 1) {
+    if (b == 0x55) {
+      ota_rx_buf_.push_back(b);
+    } else if (b != 0xAA) {
+      ota_rx_buf_.clear();
+    }
+    return;
+  }
+
+  ota_rx_buf_.push_back(b);
+  if (ota_rx_buf_.size() < 6) {
+    return;
+  }
+
+  uint16_t seq = static_cast<uint16_t>(ota_rx_buf_[2]) | (static_cast<uint16_t>(ota_rx_buf_[3]) << 8);
+  uint16_t len = static_cast<uint16_t>(ota_rx_buf_[4]) | (static_cast<uint16_t>(ota_rx_buf_[5]) << 8);
+  if (len == 0 || len > UART_OTA_CHUNK_SIZE) {
+    ota_rx_buf_.clear();
+    this->write_str("OTA_NAK:0:LEN\r\n");
+    return;
+  }
+
+  size_t total_frame_len = 10 + static_cast<size_t>(len);
+  if (ota_rx_buf_.size() < total_frame_len) {
+    return;
+  }
+
+  const uint8_t *payload = &ota_rx_buf_[6];
+  uint32_t frame_crc = static_cast<uint32_t>(ota_rx_buf_[6 + len]) |
+                       (static_cast<uint32_t>(ota_rx_buf_[7 + len]) << 8) |
+                       (static_cast<uint32_t>(ota_rx_buf_[8 + len]) << 16) |
+                       (static_cast<uint32_t>(ota_rx_buf_[9 + len]) << 24);
+  uint32_t calc_crc = esp_rom_crc32_le(0, &ota_rx_buf_[2], 4 + len);
+
+  if (calc_crc != frame_crc) {
+    ota_rx_buf_.clear();
+    char nak[32];
+    std::snprintf(nak, sizeof(nak), "OTA_NAK:%u:CRC\r\n", seq);
+    this->write_str(nak);
+    return;
+  }
+
+  if (ota_expected_seq_ > 0 && seq == static_cast<uint16_t>(ota_expected_seq_ - 1)) {
+    ota_rx_buf_.clear();
+    char ack[24];
+    std::snprintf(ack, sizeof(ack), "OTA_ACK:%u\r\n", seq);
+    this->write_str(ack);
+    return;
+  }
+
+  if (seq != ota_expected_seq_) {
+    ota_rx_buf_.clear();
+    char nak[32];
+    std::snprintf(nak, sizeof(nak), "OTA_NAK:%u:SEQ\r\n", seq);
+    this->write_str(nak);
+    return;
+  }
+
+  if (ota_received_bytes_ + len > ota_total_size_) {
+    abort_uart_ota("OVERFLOW");
+    return;
+  }
+
+  esp_err_t err = esp_ota_write(ota_handle_, payload, len);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "esp_ota_write failed: %s", esp_err_to_name(err));
+    abort_uart_ota("WRITE");
+    return;
+  }
+
+  ota_received_bytes_ += len;
+  ota_running_crc32_ = esp_rom_crc32_le(ota_running_crc32_, payload, len);
+  ota_expected_seq_++;
+  ota_rx_buf_.clear();
+
+  if (ota_received_bytes_ == ota_total_size_) {
+    if (ota_running_crc32_ != ota_expected_crc32_) {
+      ESP_LOGE(TAG, "UART OTA total CRC mismatch: got=0x%08lx expected=0x%08lx",
+               (unsigned long)ota_running_crc32_, (unsigned long)ota_expected_crc32_);
+      abort_uart_ota("TOTAL_CRC");
+      return;
+    }
+
+    err = esp_ota_end(ota_handle_);
+    ota_handle_ = 0;
+    if (err != ESP_OK) {
+      ESP_LOGE(TAG, "esp_ota_end failed: %s", esp_err_to_name(err));
+      abort_uart_ota("END");
+      return;
+    }
+
+    err = esp_ota_set_boot_partition(ota_partition_);
+    if (err != ESP_OK) {
+      ESP_LOGE(TAG, "esp_ota_set_boot_partition failed: %s", esp_err_to_name(err));
+      abort_uart_ota("BOOT");
+      return;
+    }
+
+    in_ota_mode_ = false;
+    ota_partition_ = nullptr;
+    ESP_LOGI(TAG, "UART OTA complete (%lu bytes)! Rebooting...", (unsigned long)ota_received_bytes_);
+    this->write_str("OTA_OK\r\n");
+    this->set_timeout(150, []() { App.safe_reboot(); });
+    return;
+  }
+
+  char ack[24];
+  std::snprintf(ack, sizeof(ack), "OTA_ACK:%u\r\n", seq);
+  this->write_str(ack);
 }
 
 void NixPlus::loop() {
   uint32_t now = millis();
+
+  if (in_ota_mode_) {
+    if (now - ota_last_rx_ms_ > UART_OTA_TIMEOUT_MS) {
+      abort_uart_ota("TIMEOUT");
+      return;
+    }
+    while (this->available()) {
+      handle_uart_ota_byte(this->read());
+    }
+    return;
+  }
 
   // Reset incomplete binary frame if timeout exceeded
   if (!rx_buffer_.empty() && (now - last_rx_byte_ms_ > 150)) {
